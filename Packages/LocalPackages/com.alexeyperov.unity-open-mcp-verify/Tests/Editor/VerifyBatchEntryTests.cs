@@ -1,0 +1,350 @@
+using NUnit.Framework;
+using UnityOpenMcpVerify.Batch;
+
+namespace UnityOpenMcpVerify.Tests
+{
+    using System.Linq;
+    // Covers the VerifyBatchEntry orchestration entry path: arg extraction,
+    // operation dispatch routing, and the ParseFlags validation branches.
+    //
+    // The three operation runners (RunScanAll / RunBaselineCreate /
+    // RunRegressionCheck) call the live VerifyRunner, which requires a full
+    // Unity project asset scan — those are integration paths exercised by the
+    // live MCP suites and the headless -batchmode entry. This test class owns
+    // the pure, deterministic surface: how args are sliced, how operations are
+    // dispatched, and how every malformed flag surfaces a structured failure
+    // envelope. This is where a regression in the batch CLI contract (wrong
+    // exit code, missing usage hint, swallowed parse error) would hide.
+    public static class VerifyBatchEntryTests
+    {
+        // -------------------------------------------------------------------
+        // Arg extraction (ExtractToolArgs via Execute)
+        // -------------------------------------------------------------------
+
+        [Test]
+        public static void Execute_NoArgs_ReturnsFailWithUsageHint()
+        {
+            var (exitCode, json) = VerifyBatchEntry.Execute(new string[0]);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("No tool arguments", json);
+            StringAssert.Contains("VerifyBatchEntry.Run", json,
+                "usage hint must name the executeMethod entry point.");
+        }
+
+        [Test]
+        public static void Execute_NoDoubleDash_FallsBackToExecuteMethodSlice()
+        {
+            // Without a "--" separator, args after "-executeMethod <method>"
+            // are treated as tool args. A bare operation with no flags is an
+            // unknown op only when the name is wrong; here we pass an unknown
+            // op to exercise the fallback slice without hitting a live runner.
+            var args = new[]
+            {
+                "-batchmode",
+                "-executeMethod", "UnityOpenMcpVerify.Batch.VerifyBatchEntry.Run",
+                "scan_allz", // typo — dispatches to the unknown-op branch
+            };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("Unknown operation", json);
+            StringAssert.Contains("scan_allz", json);
+        }
+
+        // -------------------------------------------------------------------
+        // Operation dispatch routing
+        // -------------------------------------------------------------------
+
+        [Test]
+        public static void Execute_UnknownOperation_ListsValidOperations()
+        {
+            var args = new[] { "--", "frobnicate" };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("Unknown operation 'frobnicate'", json);
+            // The error must list every valid op so an operator can self-correct.
+            StringAssert.Contains("scan_all", json);
+            StringAssert.Contains("baseline_create", json);
+            StringAssert.Contains("regression_check", json);
+        }
+
+        // -------------------------------------------------------------------
+        // --platform-profile validation
+        // -------------------------------------------------------------------
+
+        [Test]
+        public static void Execute_ScanAll_InvalidPlatformProfile_Fails()
+        {
+            var args = new[] { "--", "scan_all", "--platform-profile", "wasm" };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("Invalid platform-profile 'wasm'", json);
+            StringAssert.Contains("mobile", json);
+            StringAssert.Contains("desktop", json);
+        }
+
+        [Test]
+        public static void Execute_ScanAll_MissingPlatformProfileValue_Fails()
+        {
+            // The flag is last with no value following.
+            var args = new[] { "--", "scan_all", "--platform-profile" };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("--platform-profile requires a value", json);
+        }
+
+        // -------------------------------------------------------------------
+        // --fail-on-severity validation
+        // -------------------------------------------------------------------
+
+        [Test]
+        public static void Execute_ScanAll_InvalidFailOnSeverity_Fails()
+        {
+            var args = new[] { "--", "scan_all", "--fail-on-severity", "panic" };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("Invalid fail-on-severity 'panic'", json);
+        }
+
+        [Test]
+        public static void Execute_ScanAll_MissingFailOnSeverityValue_Fails()
+        {
+            var args = new[] { "--", "scan_all", "--fail-on-severity" };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("--fail-on-severity requires a value", json);
+        }
+
+        // -------------------------------------------------------------------
+        // --regression-threshold validation
+        // -------------------------------------------------------------------
+
+        [Test]
+        public static void Execute_RegressionCheck_NonIntegerThreshold_Fails()
+        {
+            // regression_check also requires --baseline-path; but the parse
+            // error for the threshold surfaces first (ParseFlags runs before
+            // the baseline-path presence check).
+            var args = new[]
+            {
+                "--", "regression_check",
+                "--baseline-path", "baseline.json",
+                "--regression-threshold", "lots",
+            };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("Invalid regression-threshold 'lots'", json);
+        }
+
+        [Test]
+        public static void Execute_RegressionCheck_NegativeThreshold_Fails()
+        {
+            var args = new[]
+            {
+                "--", "regression_check",
+                "--baseline-path", "baseline.json",
+                "--regression-threshold", "-1",
+            };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("non-negative integer", json);
+        }
+
+        [Test]
+        public static void Execute_RegressionCheck_MissingThresholdValue_Fails()
+        {
+            var args = new[]
+            {
+                "--", "regression_check",
+                "--baseline-path", "baseline.json",
+                "--regression-threshold",
+            };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("requires an integer value", json);
+        }
+
+        // -------------------------------------------------------------------
+        // --per-category-threshold validation
+        // -------------------------------------------------------------------
+
+        [Test]
+        public static void Execute_RegressionCheck_PerCategoryThreshold_Malformed_Fails()
+        {
+            // Missing the '=' separator.
+            var args = new[]
+            {
+                "--", "regression_check",
+                "--baseline-path", "baseline.json",
+                "--per-category-threshold", "missing_requals",
+            };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("Invalid --per-category-threshold 'missing_requals'", json);
+            StringAssert.Contains("<ruleId>=<int>", json);
+        }
+
+        [Test]
+        public static void Execute_RegressionCheck_PerCategoryThreshold_NegativeInt_Fails()
+        {
+            var args = new[]
+            {
+                "--", "regression_check",
+                "--baseline-path", "baseline.json",
+                "--per-category-threshold", "missing_refs=-1",
+            };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("non-negative integer", json);
+        }
+
+        [Test]
+        public static void Execute_RegressionCheck_PerCategoryThreshold_MissingValue_Fails()
+        {
+            var args = new[]
+            {
+                "--", "regression_check",
+                "--baseline-path", "baseline.json",
+                "--per-category-threshold",
+            };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("--per-category-threshold requires a value", json);
+        }
+
+        // -------------------------------------------------------------------
+        // --baseline-path presence (required for baseline_create + regression_check)
+        // -------------------------------------------------------------------
+
+        [Test]
+        public static void Execute_BaselineCreate_MissingBaselinePath_Fails()
+        {
+            var args = new[] { "--", "baseline_create" };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("--baseline-path is missing", json);
+        }
+
+        [Test]
+        public static void Execute_RegressionCheck_MissingBaselinePath_Fails()
+        {
+            var args = new[] { "--", "regression_check" };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("--baseline-path is missing", json);
+        }
+
+        // -------------------------------------------------------------------
+        // Unknown-flag rejection
+        // -------------------------------------------------------------------
+
+        [Test]
+        public static void Execute_ScanAll_UnknownFlag_Fails()
+        {
+            var args = new[] { "--", "scan_all", "--frobnicate", "yes" };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("Unknown argument '--frobnicate'", json);
+        }
+
+        // -------------------------------------------------------------------
+        // --output-path / --baseline-path missing-value
+        // -------------------------------------------------------------------
+
+        [Test]
+        public static void Execute_ScanAll_MissingOutputPathValue_Fails()
+        {
+            var args = new[] { "--", "scan_all", "--output-path" };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("--output-path requires a value", json);
+        }
+
+        [Test]
+        public static void Execute_BaselineCreate_MissingBaselinePathValue_Fails()
+        {
+            var args = new[] { "--", "baseline_create", "--baseline-path" };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            StringAssert.Contains("--baseline-path requires a value", json);
+        }
+
+        // -------------------------------------------------------------------
+        // Failure-envelope shape: every error path produces a JSON envelope
+        // with the operation + exitCode + error fields.
+        // -------------------------------------------------------------------
+
+        [Test]
+        public static void Fail_EnvelopeCarriesOperationAndExitCode()
+        {
+            // The usage-fail path has a null operation; the unknown-op path
+            // carries the (bad) operation name. Both must serialize as JSON
+            // with exitCode = ExitFail (1).
+            var args = new[] { "--", "bogus_op" };
+            var (exitCode, json) = VerifyBatchEntry.Execute(args);
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, exitCode);
+            // JsonUtility output is pretty-printed; exitCode appears as a key.
+            StringAssert.Contains("\"exitCode\"", json);
+            StringAssert.Contains("\"error\"", json);
+            StringAssert.Contains("\"operation\"", json);
+        }
+
+        // -------------------------------------------------------------------
+        // Exit-code resolution: scan incompleteness fails like a verdict.
+        // The three runners share ResolveExitCode so "a rule threw" can never
+        // read as "clean" / "no regression" through a passing exit code.
+        // -------------------------------------------------------------------
+
+        [Test]
+        public static void ResolveExitCode_IncompleteScan_FailsEvenWithCleanVerdict()
+        {
+            Assert.AreEqual(VerifyBatchEntry.ExitPass, VerifyBatchEntry.ResolveExitCode(false, false),
+                "clean verdict + complete scan passes");
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, VerifyBatchEntry.ResolveExitCode(true, false),
+                "verdict failure fails");
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, VerifyBatchEntry.ResolveExitCode(false, true),
+                "a scan with crashed rules must not exit 0 — its issues list is incomplete");
+            Assert.AreEqual(VerifyBatchEntry.ExitFail, VerifyBatchEntry.ResolveExitCode(true, true));
+        }
+
+        // -------------------------------------------------------------------
+        // Whole-project scope expansion (V1)
+        //
+        // The three batch runners (RunScanAll / RunBaselineCreate /
+        // RunRegressionCheck) must hand VerifyRunner a populated path set, not
+        // a null scope — otherwise 7 of 8 rules bail on their
+        // `scope.Paths == null` guard and the whole-project CI entry points
+        // report zero issues on a broken project. These are unit tests for the
+        // scope helper itself; the live runners remain integration paths
+        // (they call the real VerifyRunner over the project graph).
+        // -------------------------------------------------------------------
+
+        [Test]
+        public static void WholeProjectScope_ReturnsOnlyAssetsPrefixedPaths()
+        {
+            var paths = VerifyBatchEntry.WholeProjectScope();
+            Assert.IsNotNull(paths, "must never return null — rules' Length==0 guard relies on it");
+            Assert.IsTrue(paths.Length > 0,
+                "a real Unity project always has Assets/ entries — if this fires the test project is empty");
+            // Every entry must live under Assets/ (excludes Packages/, etc.)
+            // and use forward slashes regardless of platform.
+            foreach (var p in paths)
+            {
+                Assert.IsTrue(p.StartsWith("Assets/", System.StringComparison.Ordinal),
+                    $"scope must be Assets/-only, got '{p}'");
+                Assert.IsFalse(p.Contains('\\'),
+                    $"scope paths must use forward slashes, got '{p}'");
+            }
+        }
+
+        [Test]
+        public static void WholeProjectScope_DeduplicatesAndIsDeterministic()
+        {
+            // Two consecutive calls must return the same content — the helper
+            // is a pure projection over AssetDatabase and the batch runners
+            // invoke it once per operation.
+            var a = VerifyBatchEntry.WholeProjectScope().OrderBy(x => x);
+            var b = VerifyBatchEntry.WholeProjectScope().OrderBy(x => x);
+            Assert.AreEqual(a, b);
+        }
+    }
+}

@@ -1,0 +1,145 @@
+using System;
+using System.Collections.Generic;
+
+namespace UnityOpenMcpVerify.Batch
+{
+    public static class BaselineSchema
+    {
+        public const int Version = 1;
+    }
+
+    [Serializable]
+    public class SeveritySummary
+    {
+        public int error;
+        public int warn;
+        public int info;
+
+        public SeveritySummary() { }
+
+        public SeveritySummary(int error, int warn, int info)
+        {
+            this.error = error;
+            this.warn = warn;
+            this.info = info;
+        }
+    }
+
+    [Serializable]
+    public class RuleBaselineEntry
+    {
+        public string ruleId;
+        public int error;
+        public int warn;
+        public int info;
+        public List<string> issueKeys;
+
+        public RuleBaselineEntry()
+        {
+            issueKeys = new List<string>();
+        }
+    }
+
+    [Serializable]
+    public class BaselineFile
+    {
+        public int schemaVersion;
+        public string platformProfile;
+        public string generatedAt;
+        public SeveritySummary summary;
+        public List<RuleBaselineEntry> rules;
+        // Rule ids that threw while the baseline was captured. Those rules got
+        // NO entry in `rules` and their issues are excluded from `summary` —
+        // a crashed rule contributes nothing, so a clean-looking entry for it
+        // would be a baseline it never established (the same vacuous-clean
+        // failure mode VerifyResult.RulesFailed exists for). regression_check
+        // skips these rule ids on BOTH sides of the comparison. Baselines
+        // written before this field existed deserialize it as null — treated
+        // as "no rules failed" (schema stays v1; the field is additive).
+        public List<string> rulesFailed;
+
+        public BaselineFile()
+        {
+            schemaVersion = BaselineSchema.Version;
+            summary = new SeveritySummary();
+            rules = new List<RuleBaselineEntry>();
+            rulesFailed = new List<string>();
+        }
+    }
+
+    [Serializable]
+    public class BatchRuleSummary
+    {
+        public string ruleId;
+        public int error;
+        public int warn;
+        public int info;
+        public long durationMs;
+    }
+
+    [Serializable]
+    public class IssueEntry
+    {
+        public string ruleId;
+        public string severity;
+        public string assetPath;
+        public string issueCode;
+        public string description;
+    }
+
+    [Serializable]
+    public class RuleRegressionDetail
+    {
+        public string ruleId;
+        public int baselineError;
+        public int currentError;
+        public int errorDelta;
+        public int errorThreshold;
+        public bool regressed;
+    }
+
+    [Serializable]
+    public class RegressionDetail
+    {
+        public SeveritySummary baselineSummary;
+        public SeveritySummary currentSummary;
+        public int errorDelta;
+        public int errorThreshold;
+        public bool regressed;
+        // Per-rule breakdown surfaced when the caller passes per-category
+        // thresholds. Null when only the global error-threshold was used, so
+        // older callers / fixtures that never set per-category thresholds see
+        // the same JSON shape as before.
+        public List<RuleRegressionDetail> perRule;
+    }
+
+    [Serializable]
+    public class BatchResult
+    {
+        public string operation;
+        public string platformProfile;
+        public SeveritySummary summary;
+        public List<BatchRuleSummary> rules;
+        public List<IssueEntry> issues;
+        public long durationMs;
+        public int exitCode;
+        public string failOnSeverity;
+        public string baselinePath;
+        public string outputPath;
+        public RegressionDetail regression;
+        public string error;
+        // Rule ids that threw during the scan — the issues list is incomplete
+        // for these rules. Empty (JsonUtility omits nothing, so it serializes
+        // as []) on a clean run. A CI consumer gating on exitCode should treat
+        // a non-empty list as "scan incomplete", not "scan clean".
+        public List<string> rulesFailed;
+
+        public BatchResult()
+        {
+            summary = new SeveritySummary();
+            rules = new List<BatchRuleSummary>();
+            issues = new List<IssueEntry>();
+            rulesFailed = new List<string>();
+        }
+    }
+}

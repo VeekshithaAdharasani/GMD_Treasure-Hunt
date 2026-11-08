@@ -1,0 +1,59 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 93bd2791357e72b44aff37aba355b904, type: 3}
+  m_Name: RunnerRegion_AncientTreasureVault
+  m_EditorClassIdentifier: Assembly-CSharp::RunnerRegionConfig
+  regionId: 2
+  displayName: Ancient Treasure Vault
+  firstVisualSlot: 18
+  lastVisualSlot: 24
+  outgoingTransitionSlot: -1
+  floorMaterial: {fileID: 2100000, guid: c528d054685f74f468050f9732585a62, type: 2}
+  baseDecoration: {fileID: 7023988018934173317, guid: e8547cf60d04d944db71fc466d8217bd, type: 3}
+  decorationVariants:
+  - {fileID: 7023988018934173317, guid: e8547cf60d04d944db71fc466d8217bd, type: 3}
+  decorationScaleVariants:
+  - 0.985
+  - 1
+  - 1.015
+  fogColor: {r: 0.43, g: 0.28, b: 0.13, a: 1}
+  fogDensity: 0.004
+  ambientSky: {r: 0.62, g: 0.42, b: 0.2, a: 1}
+  ambientEquator: {r: 0.43, g: 0.29, b: 0.14, a: 1}
+  ambientGround: {r: 0.22, g: 0.14, b: 0.08, a: 1}
+  ambientIntensity: 0.9
+  transitionCenterZ: 0
+  transitionBlendWidth: 24
+  transitionCurve:
+    serializedVersion: 2
+    m_Curve:
+    - serializedVersion: 3
+      time: 0
+      value: 0
+      inSlope: 0
+      outSlope: 1
+      tangentMode: 0
+      weightedMode: 0
+      inWeight: 0
+      outWeight: 0
+    - serializedVersion: 3
+      time: 1
+      value: 1
+      inSlope: 1
+      outSlope: 0
+      tangentMode: 0
+      weightedMode: 0
+      inWeight: 0
+      outWeight: 0
+    m_PreInfinity: 2
+    m_PostInfinity: 2
+    m_RotationOrder: 4

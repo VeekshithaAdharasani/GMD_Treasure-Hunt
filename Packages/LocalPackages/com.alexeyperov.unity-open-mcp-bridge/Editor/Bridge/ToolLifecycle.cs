@@ -1,0 +1,231 @@
+using System.Collections.Generic;
+
+namespace UnityOpenMcpBridge
+{
+    // M13 T4.1 — Single source of truth for tool lifecycle policies.
+    //
+    // The bridge classifies every tool it dispatches. Registry tools declare
+    // their policy via [BridgeTool(Lifecycle = ...)] and are read straight off
+    // the entry; the legacy hardcoded meta-tools (dispatched via the switch in
+    // BridgeHttpServer.DispatchTool, not the registry) are classified here so
+    // the policy can never drift from what the dispatcher actually runs.
+    //
+    // The dispatcher consumes Resolve() to decide polling/settle behaviour and
+    // to decide whether the active-scene dirty guard should preflight. Unknown
+    // tools default to None — a read-only safe default — so a tool added
+    // without an explicit policy never silently triggers a long settle wait or
+    // a dirty-scene refusal.
+    public static class ToolLifecycle
+    {
+        // Legacy hardcoded meta-tools. Registry tools carry their own policy on
+        // the BridgeToolEntry and are NOT listed here (Resolve() checks the
+        // registry first).
+        private static readonly Dictionary<string, LifecyclePolicy> HardcodedPolicies = new()
+        {
+            // ----- None: read-only, no settle -----
+            { "unity_open_mcp_find_members",     LifecyclePolicy.None },
+            { "unity_open_mcp_validate_edit",    LifecyclePolicy.None },
+            { "unity_open_mcp_checkpoint_create",LifecyclePolicy.None },
+            { "unity_open_mcp_delta",            LifecyclePolicy.None },
+            { "unity_open_mcp_find_references",  LifecyclePolicy.None },
+            { "unity_open_mcp_scan_paths",       LifecyclePolicy.None },
+            { "unity_open_mcp_read_asset",       LifecyclePolicy.None },
+            { "unity_open_mcp_search_assets",    LifecyclePolicy.None },
+
+            // ----- EditorSettle: wait for asset refresh + serialization -----
+            { "unity_open_mcp_apply_fix",        LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_reserialize",      LifecyclePolicy.EditorSettle },
+            // M27 Plan 4 — batch_execute. A batch of scene/asset mutations
+            // settles on asset refresh / serialization; the batch tool itself
+            // does not force a domain reload (the v1 deny-list blocks the
+            // power tools that could — execute_csharp / invoke_method /
+            // execute_menu / script_write are not invokable as nested steps).
+            // EditorSettle covers the heaviest allowed nested op.
+            { "unity_open_mcp_batch_execute",    LifecyclePolicy.EditorSettle },
+            // M16 Plan 1 — typed asset/material/prefab mutators. They touch
+            // Assets/ (write .mat/.prefab, refresh AssetDatabase, mutate scene
+            // instances). None of them recompile editor scripts, so they wait
+            // for asset refresh but do not need the restart-then-settle path.
+            { "unity_open_mcp_assets_create_folder", LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_assets_copy",         LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_assets_move",         LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_assets_delete",       LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_assets_refresh",      LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_material_create",     LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_material_set_property",LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_material_set_keyword",LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_material_set_shader", LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_prefab_instantiate",  LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_prefab_create",       LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_prefab_open",         LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_prefab_close",        LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_prefab_save",         LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_prefab_apply",        LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_prefab_revert",       LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_prefab_unpack",       LifecyclePolicy.EditorSettle },
+            // M16 Plan 2 — typed GameObject/component mutators. They mutate
+            // live scene hierarchy (no asset writes, no script recompile),
+            // so EditorSettle is enough — no domain-reload risk.
+            { "unity_open_mcp_gameobject_create",   LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_gameobject_destroy",  LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_gameobject_duplicate",LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_gameobject_modify",   LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_gameobject_set_parent",LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_component_add",       LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_component_destroy",   LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_component_modify",    LifecyclePolicy.EditorSettle },
+            // M16 Plan 3 — typed scene mutators. scene_save/unload/set_active/
+            // focus touch the scene setup or SceneView without forcing a domain
+            // reload, so EditorSettle is enough. scene_create AND scene_open are
+            // RestartThenSettle: both default to Single mode, which closes all
+            // open scenes without prompting or saving — the active-scene dirty
+            // guard must preflight them so a user's unsaved scene work is not
+            // silently discarded (see SceneDirtyGuard.AppliesTo). scene_create /
+            // scene_open with mode:"additive" keep open scenes, so
+            // SceneDirtyGuard.AppliesTo short-circuits them before the preflight
+            // — only the Single (scene-closing) path is guarded. The explicit
+            // opt-out for the Single path is ignore_scene_dirty:true.
+            // (BatchExecuteTool additionally refuses a nested scene_create
+            // unless mode:"additive" — the single-dispatch path is the one the
+            // dirty guard protects.)
+            { "unity_open_mcp_scene_create",        LifecyclePolicy.RestartThenSettle },
+            { "unity_open_mcp_scene_open",          LifecyclePolicy.RestartThenSettle },
+            { "unity_open_mcp_scene_save",          LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_scene_unload",        LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_scene_set_active",    LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_scene_focus",         LifecyclePolicy.EditorSettle },
+            // M20 Plan 9 / T20.9.4 — SceneView pose-level tools. get_camera is
+            // read-only and falls through to None by default; set_camera mutates
+            // editor UI state only (no asset writes / no reload) and therefore
+            // remains None while still being recorded as mutating via
+            // BridgeToolClassification.MutatingTools.
+            { "unity_open_mcp_sceneview_set_camera", LifecyclePolicy.None },
+            // M16 Plan 4 — typed Package Manager mutators. add / remove
+            // rewrite Packages/manifest.json and trigger UPM resolution,
+            // which can install/remove assemblies and force a domain reload.
+            // RestartThenSettle so the dispatcher blocks until the editor
+            // finishes compiling; the read-only package tools fall through to
+            // the None default below (they are gate-free, dispatched direct).
+            { "unity_open_mcp_package_add",         LifecyclePolicy.RestartThenSettle },
+            { "unity_open_mcp_package_remove",      LifecyclePolicy.RestartThenSettle },
+            // reimport_package force-reimports a local file: package's source
+            // and calls RequestScriptCompilation — a domain reload / recompile
+            // can follow. RestartThenSettle blocks until it settles. Unlike
+            // package_add/remove it does not write manifest.json (the package
+            // id is the scope); the tool additionally reports dllMtimeBefore/
+            // After so an agent can detect a no-op recompile (specs/feedback.md).
+            { "unity_open_mcp_reimport_package",    LifecyclePolicy.RestartThenSettle },
+            // feedback-01-08-glm §5 — recompile_scripts forces a project-wide
+            // script recompile via CompilationPipeline.RequestScriptCompilation;
+            // a domain reload follows. RestartThenSettle blocks until the
+            // compile settles before returning the dllMtimeBefore/After payload.
+            { "unity_open_mcp_recompile_scripts",   LifecyclePolicy.RestartThenSettle },
+            // M16 Plan 5 — typed TagManager mutators. add_tag / add_layer
+            // rewrite ProjectSettings/TagManager.asset and refresh the asset
+            // database. None of them recompile editor scripts, so EditorSettle
+            // is enough — no domain-reload risk. The other Plan 5 tools
+            // (console_clear / console_log / editor_set_state /
+            // selection_get / selection_set / editor_undo / editor_redo /
+            // editor_get_tags / editor_get_layers / editor_undo_history /
+            // editor_clear_history) mutate editor state but
+            // write NO assets — they route as gate-free direct-response tools
+            // and fall through to the None default below. editor_set_state
+            // runs its own inline dirty guard (entering play mode can trigger
+            // the native save modal) since it is NOT in the lifecycle table.
+            { "unity_open_mcp_editor_add_tag",      LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_editor_add_layer",    LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_editor_clear_history",LifecyclePolicy.None },
+            // M16 Plan 7 — typed profiler mutator. profiler_save_data writes a
+            // .json snapshot (no script recompile) — EditorSettle. The other
+            // Plan 7 tools mutate editor state / bookkeeping but write no
+            // assets (gate-free direct-response); they fall through to None.
+            { "unity_open_mcp_profiler_save_data",  LifecyclePolicy.EditorSettle },
+            // M16 Plan 9 — typed build + settings mutators. build_set_target
+            // and build_set_defines can trigger a recompile / domain reload
+            // (RestartThenSettle — the dirty guard preflights them).
+            // build_set_scenes / settings_set_quality / settings_set_physics /
+            // settings_set_lighting write ProjectSettings assets without
+            // recompiling (EditorSettle). settings_set_player can flip
+            // scripting backend / input handler knobs that force a recompile,
+            // so it gets RestartThenSettle to be safe. build_start runs
+            // BuildPipeline.BuildPlayer in-process — long-running, but it does
+            // not force a domain reload of the editor itself; EditorSettle is
+            // enough (the deny heuristic gates the call itself).
+            { "unity_open_mcp_build_set_target",   LifecyclePolicy.RestartThenSettle },
+            { "unity_open_mcp_build_set_scenes",   LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_build_set_defines",  LifecyclePolicy.RestartThenSettle },
+            { "unity_open_mcp_build_start",        LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_settings_set_player",LifecyclePolicy.RestartThenSettle },
+            { "unity_open_mcp_settings_set_quality",  LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_settings_set_physics", LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_settings_set_lighting",LifecyclePolicy.EditorSettle },
+            // M20 Plan 9 / T20.9.3 — Project Settings remainder mutators.
+            // set_time writes TimeManager.asset (no recompile); set_quality_level
+            // writes Quality.asset (no recompile). Both EditorSettle. The read-
+            // only get_time / get_render_pipeline route as direct-response tools
+            // and fall through to the None default below. KV preferences
+            // (T20.9.2) write no project assets and route as direct-response
+            // tools (None default) — see BridgeToolClassification.
+            { "unity_open_mcp_settings_set_time",        LifecyclePolicy.EditorSettle },
+            { "unity_open_mcp_settings_set_quality_level", LifecyclePolicy.EditorSettle },
+
+            // ----- RestartThenSettle: may trigger a domain reload -----
+            // execute_csharp / invoke_method can recompile; execute_menu can
+            // hit any menu (scene switch, reimport, package op); compile_check
+            // spawns a fresh Unity recompiling from scratch.
+            { "unity_open_mcp_execute_csharp",   LifecyclePolicy.RestartThenSettle },
+            { "unity_open_mcp_invoke_method",    LifecyclePolicy.RestartThenSettle },
+            { "unity_open_mcp_execute_menu",     LifecyclePolicy.RestartThenSettle },
+
+            // ----- CustomConfirmation: external completion signal -----
+            // run_tests is async + domain-reload-safe via a file handoff the
+            // MCP server polls; the dispatcher does NOT settle-wait on it.
+            { "unity_senses_run_tests",           LifecyclePolicy.CustomConfirmation },
+
+            // M20 Plan 5 / T20.5.1 — ScriptableObject create writes a .asset
+            // via AssetDatabase.CreateAsset + SaveAssets + ImportAsset. It does
+            // NOT recompile editor scripts, so EditorSettle (wait for asset
+            // refresh) is enough — no domain-reload risk. list_assets_of_type
+            // is read-only and falls through to the None default below.
+            { "unity_open_mcp_scriptableobject_create", LifecyclePolicy.EditorSettle },
+
+            // M20 Plan 5 / T20.5.2 — asmdef create / modify write the .asmdef
+            // JSON + force a reimport, which triggers a domain reload +
+            // recompile (the same lifecycle as script_write / build_set_defines).
+            // RestartThenSettle so the dispatcher blocks until the editor
+            // finishes compiling; the dirty guard preflights it. asmdef_list /
+            // asmdef_get are read-only and fall through to the None default
+            // below.
+            { "unity_open_mcp_asmdef_create",     LifecyclePolicy.RestartThenSettle },
+            { "unity_open_mcp_asmdef_modify",     LifecyclePolicy.RestartThenSettle },
+        };
+
+        // Resolve the lifecycle policy for a dispatched tool.
+        //
+        // Registry tools win (their attribute is the authoritative declaration);
+        // legacy hardcoded tools fall through to the table above; anything else
+        // is treated as read-only (None). This keeps the safe default intact
+        // for tools added without an explicit policy.
+        public static LifecyclePolicy Resolve(string toolName)
+        {
+            if (string.IsNullOrEmpty(toolName)) return LifecyclePolicy.None;
+
+            if (BridgeToolRegistry.TryGet(toolName, out var entry))
+                return entry.Lifecycle;
+
+            return HardcodedPolicies.TryGetValue(toolName, out var hardcoded)
+                ? hardcoded
+                : LifecyclePolicy.None;
+        }
+
+        // Does resolving this policy require the dispatcher to settle-wait
+        // before returning? EditorSettle + RestartThenSettle both block on
+        // EditorApplication.isCompiling; CustomConfirmation hands off to an
+        // external poller (the MCP server) and returns immediately.
+        public static bool RequiresSettleWait(LifecyclePolicy policy)
+        {
+            return policy == LifecyclePolicy.EditorSettle
+                || policy == LifecyclePolicy.RestartThenSettle;
+        }
+    }
+}

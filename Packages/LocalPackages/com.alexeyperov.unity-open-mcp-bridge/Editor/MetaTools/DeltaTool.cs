@@ -1,0 +1,164 @@
+using System.Text;
+using System.Linq;
+using UnityOpenMcpVerify;
+
+namespace UnityOpenMcpBridge.MetaTools
+{
+    public static class DeltaTool
+    {
+        public static ToolDispatchResult Execute(string body)
+        {
+            var checkpointId = JsonBody.GetString(body, "checkpoint_id");
+            if (string.IsNullOrEmpty(checkpointId))
+                return ToolDispatchResult.Fail("missing_parameter",
+                    "'checkpoint_id' is required.");
+
+            var stored = CheckpointStore.Get(checkpointId);
+            if (stored == null)
+            {
+                // Item F — a missing checkpoint is NOT a tool failure: checkpoints
+                // are session-scoped (in-memory) and are wiped on script recompile,
+                // domain reload, or editor restart. Returning a hard error would set
+                // isError:true on the MCP response and block agent workflows. Instead
+                // return success with an explicit `unavailable` warning + recovery
+                // guidance so the agent can proceed (e.g. fall back to validate_edit).
+                //
+                // T5.4 — when the store is completely empty AND a specific id was
+                // requested, the most likely cause is a domain reload that wiped the
+                // in-memory store (the gate itself triggers reloads via asmdef_modify
+                // / package_add). Surface a distinct `checkpoint_lost_on_reload`
+                // reason so the agent can distinguish "wiped by reload" from "this id
+                // was never created in this session", and recommend checkpoint_create
+                // to re-establish the baseline.
+                bool storeEmpty = CheckpointStore.Count == 0;
+                return ToolDispatchResult.Ok(
+                    storeEmpty
+                        ? BuildLostOnReloadResult(checkpointId)
+                        : BuildUnavailableResult(checkpointId));
+            }
+
+            var paths = JsonBody.GetStringArray(body, "paths") ?? stored.Paths;
+            var categories = stored.Categories;
+
+            VerifyResult currentResult;
+            try
+            {
+                currentResult = VerifyGateAdapter.ValidatePaths(paths, categories);
+            }
+            catch (System.Exception e)
+            {
+                return ToolDispatchResult.Fail("validation_error", e.Message);
+            }
+
+            var failedRules = stored.Fingerprint.RulesFailed.Union(currentResult.RulesFailed).ToArray();
+            if (failedRules.Length > 0)
+            {
+                var detail = "{\"rulesFailed\":[" + string.Join(",", failedRules.Select(BridgeJson.EscapeString)) + "]}";
+                return ToolDispatchResult.FailWithDetail("validation_incomplete",
+                    "Delta unavailable because checkpoint or validation rules failed: " + string.Join(", ", failedRules),
+                    detail, new[] { "Resolve the rule failures, create a fresh checkpoint, and validate again before trusting a delta." });
+            }
+
+            DeltaData delta;
+            try
+            {
+                delta = VerifyGateAdapter.ComputeDelta(stored.Fingerprint, currentResult);
+            }
+            catch (System.Exception e)
+            {
+                // B-N7 / B-R9 — ComputeDelta calls IssueKey.Build, which throws
+                // ArgumentException (not just FormatException) for a '|'-bearing
+                // issueCode. Catch broadly, matching GatePolicy's ComputeDelta
+                // catch, so any such leak surfaces as the structured
+                // `delta_error` envelope instead of a generic execution_error.
+                return ToolDispatchResult.Fail("delta_error",
+                    $"Delta computation failed: {e.Message}");
+            }
+
+            var hasNewErrors = delta.NewErrors > 0;
+            return ToolDispatchResult.Ok(BuildResult(delta, hasNewErrors));
+        }
+
+        private static string BuildResult(DeltaData delta, bool hasNewErrors)
+        {
+            var sb = new StringBuilder(512);
+            sb.Append("{\"passed\":").Append(!hasNewErrors ? "true" : "false");
+
+            sb.Append(",\"summary\":{");
+            sb.Append("\"newErrors\":").Append(delta.NewErrors);
+            sb.Append(",\"newWarnings\":").Append(delta.NewWarnings);
+            sb.Append(",\"resolvedErrors\":").Append(delta.ResolvedErrors);
+            sb.Append(",\"resolvedWarnings\":").Append(delta.ResolvedWarnings);
+            sb.Append('}');
+
+            // feedback-04-08-opus §3 — bound the inlined issue-key arrays (first
+            // MaxDeltaIssuesInResponse, with a "Truncated" count for the elided
+            // tail) plus a per-rule histogram. The full key list is available via
+            // validate_edit / scan_paths; the agent branches on summary + counts.
+            BridgeJson.AppendBoundedIssueArray(sb, "newIssues", delta.NewIssueKeys);
+            BridgeJson.AppendBoundedIssueArray(sb, "resolvedIssues", delta.ResolvedIssueKeys);
+            BridgeJson.AppendCountsByRule(sb, "newIssues", delta.NewIssueKeys);
+            BridgeJson.AppendCountsByRule(sb, "resolvedIssues", delta.ResolvedIssueKeys);
+
+            sb.Append('}');
+            return sb.ToString();
+        }
+
+        // Item F — payload returned when the requested checkpoint is no longer in
+        // the session-scoped store. `passed:true` + `unavailable:true` lets the
+        // agent treat this as "no new errors detected, but I have no baseline to
+        // delta against" rather than a hard failure.
+        private static string BuildUnavailableResult(string checkpointId)
+        {
+            var sb = new StringBuilder(512);
+            sb.Append("{\"passed\":true");
+            sb.Append(",\"unavailable\":true");
+            sb.Append(",\"warning\":\"Checkpoint '")
+              .Append(Esc(checkpointId))
+              .Append("' is no longer available. Checkpoints are session-scoped (in-memory) and are cleared on script recompile, domain reload, or editor restart — this does not indicate a problem with the project.\"");
+            sb.Append(",\"agentNextSteps\":[");
+            sb.Append("\"The pre-change baseline is gone, so a delta cannot be computed.\",");
+            sb.Append("\"To verify current state directly, call unity_open_mcp_validate_edit (or unity_open_mcp_scan_paths) on the relevant paths.\",");
+            sb.Append("\"For future delta checks, call unity_open_mcp_checkpoint_create immediately before mutating, then unity_open_mcp_delta right after.\"");
+            sb.Append("]}");
+            return sb.ToString();
+        }
+
+        // T5.4 — payload returned when the store is empty AND a specific id was
+        // requested. The empty-store signal alone cannot distinguish "wiped by a
+        // domain reload" from "no checkpoint was ever created this session" (the
+        // store tracks no process-lifetime marker), so the wording must cover
+        // both. The most likely cause is a domain reload triggered by the gate
+        // flow itself (asmdef_modify / package_add / reimport_package force a
+        // recompile) or an editor restart. Distinct from BuildUnavailableResult
+        // (which fires when the id is unknown but other checkpoints still exist):
+        // here the whole store is empty, so the agent should re-create the
+        // baseline with checkpoint_create.
+        private static string BuildLostOnReloadResult(string checkpointId)
+        {
+            var sb = new StringBuilder(512);
+            sb.Append("{\"passed\":true");
+            sb.Append(",\"unavailable\":true");
+            sb.Append(",\"checkpointLostOnReload\":true");
+            sb.Append(",\"warning\":\"Checkpoint '")
+              .Append(Esc(checkpointId))
+              .Append("' was not found and the in-memory checkpoint store is empty. The most likely " +
+                      "cause is a domain reload (script recompile, package add/remove, asmdef edit) " +
+                      "or editor restart wiping the process-lifetime store — the gate flow itself can " +
+                      "trigger this (e.g. asmdef_modify / package_add force a recompile). It is also " +
+                      "possible no checkpoint has been created yet this session. Either way a delta " +
+                      "cannot be computed. This does not indicate a problem with the project.\"");
+            sb.Append(",\"agentNextSteps\":[");
+            sb.Append("\"The checkpoint store is empty — the pre-change baseline is gone (or was never created) and a delta cannot be computed.\",");
+            sb.Append("\"To verify current state directly, call unity_open_mcp_validate_edit (or unity_open_mcp_scan_paths) on the relevant paths.\",");
+            sb.Append("\"To re-establish a baseline, call unity_open_mcp_checkpoint_create on the paths you intend to delta-check, then mutate, then unity_open_mcp_delta.\"");
+            sb.Append("]}");
+            return sb.ToString();
+        }
+
+        // Single source of truth for JSON string-content escaping is BridgeJson
+        // (T30.5). Returns escaped CONTENT (no surrounding quotes), matching the
+        // call sites here; preserves the `null ⇒ ""` contract.
+        private static string Esc(string s) => BridgeJson.EscapeStringContent(s);
+    }
+}

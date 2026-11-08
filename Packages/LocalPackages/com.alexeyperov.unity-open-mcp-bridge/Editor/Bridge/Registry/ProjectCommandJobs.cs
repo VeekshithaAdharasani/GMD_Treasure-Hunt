@@ -1,0 +1,221 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using UnityEditor;
+using UnityOpenMcpBridge.MetaTools;
+
+namespace UnityOpenMcpBridge
+{
+    // Domain-local execution only. Losing this record is unknown outcome, never a restart signal.
+    [InitializeOnLoad]
+    internal static class ProjectCommandJobs
+    {
+        private sealed class Entry
+        {
+            internal string Id, Owner, Body, Phase = "accepted", State = "running", Result;
+            internal DateTime Finished;
+            internal bool Cancellable;
+            internal CancellationTokenSource Cancellation = new CancellationTokenSource();
+        }
+        private static readonly Dictionary<string, Entry> entries = new Dictionary<string, Entry>();
+        private static bool shuttingDown;
+        static ProjectCommandJobs()
+        {
+            AssemblyReloadEvents.beforeAssemblyReload += Shutdown;
+            EditorApplication.quitting += Shutdown;
+        }
+        private static void Shutdown()
+        {
+            shuttingDown = true;
+            foreach (var entry in entries.Values)
+            {
+                try { entry.Cancellation.Cancel(); } catch { }
+                entry.Cancellation.Dispose();
+            }
+        }
+        internal static Func<bool> TestRunActive;
+        internal static bool Active => entries.Values.Any(e => e.Result == null);
+        // Every bridge tool dispatch asks here on the main thread, just before
+        // the tool runs: job records are main-thread state, and a start can
+        // land between the HTTP handler and that frame. The job itself never
+        // dispatches through a tool route, so it is never refused by its own guard.
+        internal static ToolDispatchResult Refuse(ToolRequestContract contract)
+        {
+            if (!contract.ConflictsWithJob) return null;
+            var running = entries.Values.FirstOrDefault(e => e.Result == null);
+            return running == null ? null : BusyRefusal(running, contract);
+        }
+
+        // The refusal names the running job so its owner can wait on it through the
+        // MCP jobs API (the bridge job id is the MCP job id), and says what to do meanwhile.
+        private static ToolDispatchResult BusyRefusal(Entry job, ToolRequestContract contract)
+        {
+            var commandId = ProjectCommandInvocation.Field(job.Body, "command_id");
+            var steps = contract.BatchPlan?.Steps
+                .Where(step => step.IsMutating || ToolRequestContract.ConflictsWithJobByName(step.Tool)).ToArray();
+            var message = new StringBuilder("Refused before running: asynchronous project command job ").Append(job.Id)
+                .Append(" ('").Append(commandId).Append("', phase '").Append(job.Phase)
+                .Append("') owns the Editor mutation scope until it reaches a terminal state.");
+            if (steps != null && steps.Length > 0)
+                message.Append(" Conflicting batch steps: ")
+                    .Append(string.Join(", ", steps.Select(step => "#" + step.Index + " " + step.Tool))).Append('.');
+            if (contract.ReadOnlyAsserted)
+                message.Append(" Snippets with read_only: true are refused too: the bridge cannot verify that a snippet writes nothing, so it runs no snippet inside a job's checkpoint/validation interval.");
+            message.Append(" Wait for the job, then retry once; do not loop-retry.");
+
+            var detail = new StringBuilder("{\"job\":{\"jobId\":").Append(BridgeJson.EscapeString(job.Id))
+                .Append(",\"commandId\":").Append(BridgeJson.EscapeString(commandId))
+                .Append(",\"state\":").Append(BridgeJson.EscapeString(job.State))
+                .Append(",\"phase\":").Append(BridgeJson.EscapeString(job.Phase)).Append('}');
+            if (steps != null && steps.Length > 0)
+                detail.Append(",\"conflictingSteps\":[").Append(string.Join(",", steps.Select(step =>
+                    "{\"index\":" + step.Index + ",\"tool\":" + BridgeJson.EscapeString(step.Tool) + "}"))).Append(']');
+            detail.Append('}');
+
+            var next = new List<string>
+            {
+                "Wait for job " + job.Id + " with unity_open_mcp_jobs (action \"wait\" with job_id \"" + job.Id
+                    + "\" and a bounded timeout_ms, or action \"status\"). Only the agent that started the job can observe it; "
+                    + "any other agent gets job_not_found and should do other work before checking back.",
+                "Meanwhile use typed read tools (unity_open_mcp_scene_get_data, unity_open_mcp_read_asset, unity_open_mcp_search_assets, unity_open_mcp_component_get, unity_senses_read_console without clear); reads stay available during the job.",
+                "Retry this call once after the job is succeeded, failed, cancelled or orphaned; never retry it in a loop while the job runs.",
+            };
+            if (contract.ReadOnlyAsserted)
+                next.Insert(2, "Neither read_only: true nor wrapping the snippet in batch_execute gets execute_csharp past a running job; use a typed read tool for the probe.");
+            return ToolDispatchResult.FailWithDetail("job_busy", message.ToString(), detail.ToString(), next.ToArray());
+        }
+        internal static string Handle(string body, string owner)
+        {
+            if (!BridgeJson.IsValidJsonObject(body)) return Error("invalid_arguments", "JSON object required.");
+            var action = ProjectCommandInvocation.Field(body, "action");
+            var id = ProjectCommandInvocation.Field(body, "job_id");
+            var keys = JsonBody.GetObjectKeys(body);
+            var allowed = action == "start" ? new[] { "action", "job_id", "invocation" } : new[] { "action", "job_id" };
+            if (keys.Any(k => !allowed.Contains(k)) || keys.Distinct().Count() != keys.Count)
+                return Error("invalid_arguments", "Unexpected or duplicate job transport keys.");
+            if (!Guid.TryParse(id, out _)) return Error("invalid_arguments", "job_id must be a UUID.");
+            foreach (var key in entries.Where(p => p.Value.Result != null && DateTime.UtcNow - p.Value.Finished > TimeSpan.FromMinutes(30)).Select(p => p.Key).ToArray())
+            { entries[key].Cancellation.Dispose(); entries.Remove(key); }
+            if (entries.TryGetValue(id, out var existing))
+            {
+                if (existing.Owner != owner) return Error("job_not_found", "Unknown job owner.");
+                if (action == "start" && existing.Body != JsonBody.GetTopLevelRawValue(body, "invocation"))
+                    return Error("idempotency_conflict", "Job id belongs to different arguments.");
+                if (action == "cancel")
+                {
+                    if (!existing.Cancellable) return Error("not_cancellable", "Command has no cooperative cancellation contract.");
+                    // Shutdown() has already cancelled and disposed every
+                    // token source; the record stays as it was so the caller
+                    // reads the state rather than a disposed-token fault.
+                    if (existing.Result == null && !shuttingDown)
+                    {
+                        existing.State = "cancel_requested";
+                        try { existing.Cancellation.Cancel(); } catch (ObjectDisposedException) { }
+                    }
+                }
+                else if (action != "status" && action != "start") return Error("invalid_arguments", "Use start, status or cancel.");
+                return Snapshot(existing);
+            }
+            if (action != "start") return Error("job_not_found", "Job record lost or expired; do not restart blindly.");
+            if (BridgeToolTogglePolicy.IsDisabled(ProjectCommandInvocation.ToolName)) return Error("tool_disabled", "Project commands are disabled.");
+            if (TestRunActive?.Invoke() == true) return Error("editor_busy", "A test run owns the Editor.");
+            var busy = entries.Values.FirstOrDefault(e => e.Result == null);
+            if (busy != null) return Error("job_busy", "Another project command is still executing (job " + busy.Id + ", '"
+                + ProjectCommandInvocation.Field(busy.Body, "command_id") + "', phase '" + busy.Phase + "'). Wait for it to reach a terminal state before starting another job.");
+            if (entries.Count >= 256) return Error("job_capacity", "Job retention capacity reached.");
+            if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode)
+                return Error("editor_busy", "Start project jobs in a settled EditMode Editor.");
+            var invocation = JsonBody.GetTopLevelRawValue(body, "invocation");
+            if (invocation == null || System.Text.Encoding.UTF8.GetByteCount(invocation) > 256 * 1024)
+                return Error("invalid_arguments", "invocation must be an object within 256 KiB.");
+            var entry = new Entry { Id = id, Owner = owner, Body = invocation };
+            var context = new ProjectCommandContext(id, entry.Cancellation.Token, phase => entry.Phase = phase);
+            // Refusals past the transport checks carry the invocation's gate envelope and audit record.
+            string Reject(GateDispatchResult rejected, LifecyclePolicy lifecycle)
+            {
+                entry.Cancellation.Dispose();
+                var gate = BridgeRequestBody.ExtractGateMode(invocation);
+                ProjectCommandInvocation.Decorate(rejected, invocation, 0);
+                BridgeAuditRecorder.RecordGateRun(ProjectCommandInvocation.ToolName, gate, rejected, ProjectCommandInvocation.ScopedPaths(invocation));
+                return BridgeJson.BuildGateEnvelope(rejected, gate, lifecycle);
+            }
+            var refusal = ProjectCommandInvocation.Preflight(invocation, out var command, out var values, context);
+            if (refusal != null) return Reject(GatePolicy.Skipped(refusal, "request_rejected"), LifecyclePolicy.None);
+            if (!command.Attribute.Async) { entry.Cancellation.Dispose(); return Error("job_operation_unsupported", "Command is synchronous."); }
+            // Same dirty-scene preflight as the synchronous route, refused before any work so
+            // the caller can save/discard or opt out with ignore_scene_dirty. The catalog
+            // currently refuses async disruptive lifecycles; this keeps the start path safe
+            // without depending on that declaration rule.
+            var sceneDirty = SceneDirtyGuard.Refuse(new ToolRequestContract
+            {
+                ToolName = ProjectCommandInvocation.ToolName,
+                IsMutating = command.Attribute.IsMutating,
+                Lifecycle = command.Attribute.Lifecycle,
+            }, invocation);
+            if (sceneDirty != null) return Reject(sceneDirty, command.Attribute.Lifecycle);
+            entry.Cancellable = command.Attribute.Cancellable;
+            entries.Add(id, entry);
+            // Let the start transport finish before checkpointing or invoking project code.
+            EditorUpdateOnce.Schedule(() => _ = Run(entry, command, values));
+            return Snapshot(entry);
+        }
+        private static async Task Run(Entry entry, ProjectCommandCatalog.Entry command, object[] values)
+        {
+            var mode = BridgeRequestBody.ExtractGateMode(entry.Body);
+            bool cancelled = false;
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            async Task<ToolDispatchResult> Invoke()
+            {
+                try
+                {
+                    entry.Cancellation.Token.ThrowIfCancellationRequested();
+                    entry.Phase = "executing";
+                    ProjectCommandInvocation.RecordStarted(entry.Body, command, entry.Id);
+                    var task = (Task<string>)command.Method.Invoke(null, values);
+                    var raw = await task;
+                    return ToolDispatchResult.Ok("{\"result\":" + OutputSerializer.SerializeJson(raw) + "}");
+                }
+                catch (Exception ex)
+                {
+                    var cause = ex is TargetInvocationException tie ? tie.InnerException ?? ex : ex;
+                    cancelled = cause is OperationCanceledException && entry.Cancellation.IsCancellationRequested;
+                    return command.Attribute.IsMutating
+                        ? ToolDispatchResult.PartialFailure(cancelled ? "cancelled" : "execution_error", cause.Message, null)
+                        : ToolDispatchResult.Fail(cancelled ? "cancelled" : "execution_error", cause.Message);
+                }
+                finally
+                {
+                    entry.Phase = "settling";
+                    while (!shuttingDown && (EditorApplication.isCompiling || EditorApplication.isUpdating)) await Task.Delay(50);
+                    if (shuttingDown) throw new OperationCanceledException("Editor domain ownership lost.");
+                    entry.Phase = "validating";
+                }
+            }
+            try
+            {
+                entry.Phase = "checkpoint";
+                var result = command.Attribute.IsMutating
+                    ? await GatePolicy.ExecuteAsync(GatePolicy.ParseMode(mode), ProjectCommandInvocation.ScopedPaths(entry.Body), Invoke)
+                    : GatePolicy.Skipped(await Invoke(), "read_only");
+                result.EffectiveReadOnly = !command.Attribute.IsMutating;
+                ProjectCommandInvocation.Decorate(result, entry.Body, watch.ElapsedMilliseconds);
+                result.ProjectCommandJson = result.ProjectCommandJson.Replace("\"jobId\":null", "\"jobId\":" + BridgeJson.EscapeString(entry.Id));
+                BridgeAuditRecorder.RecordGateRun(ProjectCommandInvocation.ToolName, mode, result, ProjectCommandInvocation.ScopedPaths(entry.Body));
+                entry.Result = BridgeJson.BuildGateEnvelope(result, mode, command.Attribute.Lifecycle);
+                entry.State = cancelled ? "cancelled" : result.Mutation.Success && !result.GateFailed ? "succeeded" : "failed";
+            }
+            catch (Exception ex)
+            { entry.State = "failed"; entry.Result = Error("execution_error", ex.Message); }
+            entry.Phase = entry.State;
+            entry.Finished = DateTime.UtcNow;
+        }
+        private static string Error(string code, string message) => ProjectCommandCatalog.Error(code, message);
+        private static string Snapshot(Entry entry) => "{\"job_id\":" + BridgeJson.EscapeString(entry.Id)
+            + ",\"state\":" + BridgeJson.EscapeString(entry.State) + ",\"phase\":" + BridgeJson.EscapeString(entry.Phase)
+            + ",\"result\":" + (entry.Result ?? "null") + "}";
+    }
+}

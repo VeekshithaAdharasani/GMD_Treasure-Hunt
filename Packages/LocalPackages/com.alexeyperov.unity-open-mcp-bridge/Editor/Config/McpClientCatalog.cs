@@ -1,0 +1,867 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+
+namespace UnityOpenMcpBridge.Config
+{
+    /// <summary>
+    /// In-Unity mirror of the Hub wizard's MCP client catalog (M27 Plan 5).
+    ///
+    /// The Hub wizard (Rust) is the canonical writer; this catalog exists so
+    /// the bridge window can render a "Configure AI client" panel that
+    /// generates the same JSON/TOML snippet an operator would get from the
+    /// wizard Step 4, without leaving Unity. The bytes produced here match
+    /// the Rust envelope builders for every Tier A client.
+    ///
+    /// Adding a client is a two-step change: add a row to <see cref="Clients"/>
+    /// and implement its envelope in <see cref="BuildEntryFields"/>. The skill
+    /// install path comes from <c>skills/client-paths.json</c> (single source
+    /// of truth for the Hub + mcp-server); this catalog only owns the config
+    /// envelope + target path.
+    /// </summary>
+    internal static class McpClientCatalog
+    {
+        /// <summary>
+        /// One row per supported MCP client. Order is the display order in the
+        /// bridge window dropdown. <see cref="Id"/> is the stable wire key
+        /// matching the Hub Rust <c>McpClientId</c> camelCase serialization
+        /// and the <c>skills/client-paths.json</c> <c>mcpClientMapping</c>.
+        /// </summary>
+        public static readonly ClientEntry[] Clients =
+        {
+            new ClientEntry("cursor", "Cursor", "mcpServers", Envelope.McpServersStdio, Scope.Global, "$HOME/.cursor/mcp.json"),
+            new ClientEntry("cursor-project", "Cursor (project)", "mcpServers", Envelope.McpServersStdio, Scope.Project, ".cursor/mcp.json"),
+            new ClientEntry("claudeCode", "Claude Code (CLI)", "", Envelope.CliOnly, Scope.None, null),
+            new ClientEntry("zcodeProject", "ZCode (project)", "mcp.servers", Envelope.ZcodeStdio, Scope.Project, ".zcode/config.json"),
+            new ClientEntry("claudeDesktop", "Claude Desktop", "mcpServers", Envelope.McpServersStdio, Scope.Global, null, OsPath.ClaudeDesktop),
+            new ClientEntry("cline", "Cline (VS Code)", "mcpServers", Envelope.McpServersStdio, Scope.Global, null, OsPath.Cline),
+            new ClientEntry("gemini", "Gemini CLI", "mcpServers", Envelope.McpServersStdio, Scope.Project, ".gemini/settings.json"),
+            new ClientEntry("githubCopilotCli", "GitHub Copilot CLI", "mcpServers", Envelope.GithubCopilotCli, Scope.Project, ".mcp.json"),
+            new ClientEntry("kiloCode", "Kilo Code", "mcpServers", Envelope.McpServersStdio, Scope.Project, ".kilocode/mcp.json"),
+            new ClientEntry("rider", "Rider (Junie)", "mcpServers", Envelope.McpServersStdio, Scope.Project, ".junie/mcp/mcp.json"),
+            new ClientEntry("unityAi", "Unity AI", "mcpServers", Envelope.McpServersStdio, Scope.Project, "UserSettings/mcp.json"),
+            new ClientEntry("zoocode", "ZooCode", "mcpServers", Envelope.McpServersStdio, Scope.Project, ".roo/mcp.json"),
+            new ClientEntry("antigravity", "Antigravity", "mcpServers", Envelope.Antigravity, Scope.Global, "$HOME/.gemini/antigravity/mcp_config.json"),
+            new ClientEntry("vscodeCopilot", "VS Code Copilot", "servers", Envelope.McpServersStdio, Scope.Project, ".vscode/mcp.json"),
+            new ClientEntry("vsCopilot", "Visual Studio Copilot", "servers", Envelope.McpServersStdio, Scope.Project, ".vs/mcp.json"),
+            new ClientEntry("opencodeGlobal", "OpenCode (global)", "mcp", Envelope.OpenCode, Scope.Global, "$HOME/.config/opencode/opencode.json"),
+            new ClientEntry("opencodeProject", "OpenCode (project)", "mcp", Envelope.OpenCode, Scope.Project, "opencode.json"),
+            new ClientEntry("zcodeGlobal", "ZCode (global)", "mcp.servers", Envelope.ZcodeStdio, Scope.Global, "$HOME/.zcode/cli/config.json"),
+            new ClientEntry("codex", "Codex", "mcp_servers", Envelope.Codex, Scope.Project, ".codex/config.toml"),
+            new ClientEntry("manual", "Manual / copy JSON", "", Envelope.Manual, Scope.None, null),
+        };
+
+        public const string ServerKey = "unity-open-mcp";
+
+        /// <summary>
+        /// How many directories above the Unity project a project-scoped client
+        /// config may live in and still count as configuring this project.
+        ///
+        /// A Unity project is very often a subfolder of the repository that
+        /// holds the agent configs (<c>&lt;repo&gt;/Client</c>,
+        /// <c>&lt;repo&gt;/unity/Client</c>, …). Clients read those files
+        /// relative to the workspace root they were opened on, not relative to
+        /// <c>Assets/</c>, so a config one or two levels up is the normal
+        /// layout — not a missing config. Four levels covers the deepest
+        /// realistic nesting without wandering off into unrelated trees.
+        /// </summary>
+        public const int MaxAncestorLevels = 4;
+
+        public enum Scope { Global, Project, None }
+
+        /// <summary>
+        /// Global clients whose config path is not one <c>$HOME</c>-relative
+        /// template but an OS-specific location. Kept as a kind rather than a
+        /// per-platform template string so the resolution lives in one
+        /// version-gated helper, mirroring the Hub wizard's Rust resolvers
+        /// (<c>claude_desktop_config_path</c> / <c>cline_settings_path</c>) —
+        /// the two must agree or "configured" detection and the config
+        /// rewriter would disagree about which file a client reads.
+        /// </summary>
+        public enum OsPath { None, ClaudeDesktop, Cline }
+
+        public enum Envelope
+        {
+            McpServersStdio,
+            OpenCode,
+            ZcodeStdio,
+            GithubCopilotCli,
+            Antigravity,
+            Codex,
+            CliOnly,
+            Manual,
+        }
+
+        public readonly struct ClientEntry
+        {
+            public readonly string Id;
+            public readonly string DisplayName;
+            public readonly string MergeKey;
+            public readonly Envelope EnvelopeKind;
+            public readonly Scope ScopeKind;
+            /// <summary>Relative or <c>$HOME</c>-prefixed path template;
+            /// <c>null</c> for CLI/clipboard-only clients and for OS-specific
+            /// global paths, which carry an <see cref="OsPathKind"/> instead.</summary>
+            public readonly string PathTemplate;
+            /// <summary>OS-specific global path family, when this client has no
+            /// single <c>$HOME</c> template. <see cref="OsPath.None"/> otherwise.</summary>
+            public readonly OsPath OsPathKind;
+
+            public ClientEntry(string id, string displayName, string mergeKey, Envelope envelope, Scope scope, string pathTemplate, OsPath osPath = OsPath.None)
+            {
+                Id = id;
+                DisplayName = displayName;
+                MergeKey = mergeKey;
+                EnvelopeKind = envelope;
+                ScopeKind = scope;
+                PathTemplate = pathTemplate;
+                OsPathKind = osPath;
+            }
+
+            public bool IsFileBacked => EnvelopeKind != Envelope.CliOnly && EnvelopeKind != Envelope.Manual;
+            public bool IsCliOnly => EnvelopeKind == Envelope.CliOnly;
+        }
+
+        // --- commit-safe (portable) configuration ------------------------------
+        //
+        // A config committed to the repository cannot carry this machine's
+        // absolute project path or the bridge port hashed from it. Mirrors the
+        // Hub writer's `portable_strategy` and the `setup` CLI's client matrix
+        // (mcp-server/src/setup/portable-config.ts); keep the three in step.
+
+        /// <summary>How a client's entry can name the Unity project without a
+        /// machine path.</summary>
+        public enum PortableStrategy
+        {
+            /// <summary>No portable form: a global config outside any workspace.</summary>
+            Absolute,
+            /// <summary>The client expands <c>${workspaceFolder}</c> in env values.</summary>
+            Interpolation,
+            /// <summary>The server resolves the project from its spawn directory:
+            /// <c>--project-from-cwd [--unity-subpath &lt;rel&gt;]</c>.</summary>
+            Args,
+            /// <summary>A committed shell script resolves the project from its own
+            /// location (clients that support neither of the above).</summary>
+            Wrapper,
+        }
+
+        public const string WorkspaceFolderVar = "${workspaceFolder}";
+
+        /// <summary>Wrapper location relative to the workspace root when the
+        /// Unity project is a subfolder of the repository.</summary>
+        public const string MonorepoWrapperPath = "scripts/mcp/unity-open-mcp.sh";
+
+        /// <summary>Wrapper location when the Unity project IS the repository.</summary>
+        public const string UnityRootWrapperPath = ".unity-open-mcp/mcp-wrapper.sh";
+
+        public static PortableStrategy PortableStrategyFor(ClientEntry client)
+        {
+            if (client.ScopeKind == Scope.Global) return PortableStrategy.Absolute;
+            switch (client.Id)
+            {
+                case "cursor-project":
+                case "vscodeCopilot":
+                case "vsCopilot":
+                    return PortableStrategy.Interpolation;
+                case "codex":
+                    return PortableStrategy.Wrapper;
+                default:
+                    return PortableStrategy.Args;
+            }
+        }
+
+        /// <summary>Where a portable entry goes and how it names the Unity
+        /// folder: the workspace root the AI client is opened on, and the Unity
+        /// project relative to it (POSIX separators, empty when they are the
+        /// same folder).</summary>
+        public readonly struct PortablePlacement
+        {
+            public readonly PortableStrategy Strategy;
+            public readonly string WorkspaceRoot;
+            public readonly string UnitySubpath;
+
+            public PortablePlacement(PortableStrategy strategy, string workspaceRoot, string unitySubpath)
+            {
+                Strategy = strategy;
+                WorkspaceRoot = workspaceRoot;
+                UnitySubpath = unitySubpath ?? "";
+            }
+
+            /// <summary>Committed wrapper path relative to <see cref="WorkspaceRoot"/>.</summary>
+            public string WrapperRelativePath =>
+                UnitySubpath.Length > 0 ? MonorepoWrapperPath : UnityRootWrapperPath;
+
+            /// <summary>On-disk wrapper path (forward slashes), the file the
+            /// Configure panel writes and the wrapper snippet runs.</summary>
+            public string WrapperAbsolutePath =>
+                Path.Combine(WorkspaceRoot, WrapperRelativePath).Replace('\\', '/');
+        }
+
+        /// <summary>
+        /// Portable placement for <paramref name="client"/>, or <c>null</c> when
+        /// the entry must carry the absolute path after all: a global config, or
+        /// a Unity project outside <paramref name="workspaceRoot"/>. Unity AI
+        /// reads its config from inside the Unity project, so its workspace is
+        /// always that project.
+        /// </summary>
+        public static PortablePlacement? ResolvePortablePlacement(
+            ClientEntry client, string projectPath, string workspaceRoot)
+        {
+            var strategy = PortableStrategyFor(client);
+            if (strategy == PortableStrategy.Absolute || string.IsNullOrEmpty(projectPath)) return null;
+            var project = NormalizeDir(projectPath);
+            var workspace = client.Id == "unityAi" || string.IsNullOrEmpty(workspaceRoot)
+                ? project
+                : NormalizeDir(workspaceRoot);
+            var subpath = RelativeSubpath(workspace, project);
+            if (subpath == null) return null;
+            return new PortablePlacement(strategy, workspace, subpath);
+        }
+
+        /// <summary>
+        /// The repository root an AI client is usually opened on: the nearest
+        /// of the project folder and its ancestors (the same walk as
+        /// <see cref="ResolveSearchDirectories"/>) that holds a <c>.git</c>
+        /// entry. <c>null</c> when the project is not inside a repository.
+        /// <paramref name="hasRepoMarker"/> is a test seam.
+        /// </summary>
+        public static string FindWorkspaceRoot(
+            string projectPath, string homePath = null, Func<string, bool> hasRepoMarker = null)
+        {
+            var probe = hasRepoMarker ?? HasGitEntry;
+            foreach (var dir in ResolveSearchDirectories(projectPath, homePath))
+            {
+                if (probe(dir)) return dir;
+            }
+            return null;
+        }
+
+        private static bool HasGitEntry(string dir)
+        {
+            try
+            {
+                var git = Path.Combine(dir, ".git");
+                // A worktree or submodule checkout has a `.git` file, not a folder.
+                return Directory.Exists(git) || File.Exists(git);
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        // `project` below `workspace` as a POSIX relative path; "" when equal,
+        // null when outside. Case-insensitive like the rest of the path math
+        // here (macOS and Windows volumes usually are).
+        private static string RelativeSubpath(string workspace, string project)
+        {
+            if (string.Equals(workspace, project, StringComparison.OrdinalIgnoreCase)) return "";
+            var prefix = workspace.EndsWith("/") ? workspace : workspace + "/";
+            if (!project.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return null;
+            return project.Substring(prefix.Length);
+        }
+
+        /// <summary>
+        /// Build the config snippet (JSON or TOML) for a client against the
+        /// given project + port + launch command. Mirrors the Hub Rust
+        /// envelope builders so the bytes match the wizard's output. With a
+        /// <paramref name="portable"/> placement the snippet carries no machine
+        /// path and no bridge port, so it can be committed.
+        /// </summary>
+        public static string BuildSnippet(
+            ClientEntry client,
+            string unityProjectPath,
+            int bridgePort,
+            string command,
+            IReadOnlyList<string> args,
+            PortablePlacement? portable = null)
+        {
+            if (portable.HasValue)
+            {
+                return BuildPortableSnippet(client, portable.Value, command, args);
+            }
+            if (client.EnvelopeKind == Envelope.CliOnly)
+            {
+                return ClaudeMcpAddCommand(unityProjectPath, bridgePort, command, args);
+            }
+            if (client.EnvelopeKind == Envelope.Codex)
+            {
+                // Codex snippet is a full TOML table block.
+                return CodexTomlEntry(command, args, unityProjectPath, bridgePort);
+            }
+            // Build the entry as a dictionary tree, then wrap it under the
+            // merge key (handling nested keys like "mcp.servers") and
+            // serialize once. Manual clients emit just the bare entry.
+            var entryFields = BuildEntryFields(client, EnvMap(unityProjectPath, bridgePort), command, args);
+            if (client.EnvelopeKind == Envelope.Manual || string.IsNullOrEmpty(client.MergeKey))
+            {
+                return SerializeJson(entryFields);
+            }
+            var segments = client.MergeKey.Split('.');
+            return BuildNestedJson(segments, ServerKey, entryFields);
+        }
+
+        private static string BuildPortableSnippet(
+            ClientEntry client, PortablePlacement placement, string command, IReadOnlyList<string> args)
+        {
+            var env = new Dictionary<string, string>();
+            var launchArgs = new List<string>(args);
+            switch (placement.Strategy)
+            {
+                case PortableStrategy.Interpolation:
+                    env[BridgeConstants.ProjectPathEnvVar] = placement.UnitySubpath.Length > 0
+                        ? WorkspaceFolderVar + "/" + placement.UnitySubpath
+                        : WorkspaceFolderVar;
+                    break;
+                case PortableStrategy.Args:
+                    launchArgs.Add("--project-from-cwd");
+                    if (placement.UnitySubpath.Length > 0)
+                    {
+                        launchArgs.Add("--unity-subpath");
+                        launchArgs.Add(placement.UnitySubpath);
+                    }
+                    break;
+                case PortableStrategy.Wrapper:
+                    // The script exports UNITY_PROJECT_PATH and execs the
+                    // pinned package itself; the client only runs it.
+                    command = "bash";
+                    launchArgs = new List<string> { placement.WrapperRelativePath };
+                    break;
+            }
+
+            if (client.EnvelopeKind == Envelope.CliOnly)
+            {
+                return ClaudeMcpAddCommandPortable(command, launchArgs);
+            }
+            if (client.EnvelopeKind == Envelope.Codex)
+            {
+                return CodexTomlHeader(command, launchArgs);
+            }
+            var entryFields = BuildEntryFields(client, env, command, launchArgs);
+            if (client.EnvelopeKind == Envelope.Manual || string.IsNullOrEmpty(client.MergeKey))
+            {
+                return SerializeJson(entryFields);
+            }
+            return BuildNestedJson(client.MergeKey.Split('.'), ServerKey, entryFields);
+        }
+
+        /// <summary>Build the entry as a dictionary tree (the leaf object).</summary>
+        private static Dictionary<string, object> BuildEntryFields(ClientEntry client, Dictionary<string, string> env, string command, IReadOnlyList<string> args)
+        {
+            var argsList = new List<object>();
+            foreach (var a in args) argsList.Add(a);
+            switch (client.EnvelopeKind)
+            {
+                case Envelope.McpServersStdio:
+                    return new Dictionary<string, object>
+                    {
+                        { "type", "stdio" },
+                        { "command", command },
+                        { "args", argsList },
+                        { "env", env },
+                    };
+                case Envelope.GithubCopilotCli:
+                    return new Dictionary<string, object>
+                    {
+                        { "command", command },
+                        { "args", argsList },
+                        { "tools", new List<object> { "*" } },
+                        { "env", env },
+                    };
+                case Envelope.Antigravity:
+                    return new Dictionary<string, object>
+                    {
+                        { "disabled", false },
+                        { "command", command },
+                        { "args", argsList },
+                        { "env", env },
+                    };
+                case Envelope.OpenCode:
+                {
+                    var cmdArray = new List<object> { command };
+                    foreach (var a in args) cmdArray.Add(a);
+                    return new Dictionary<string, object>
+                    {
+                        { "type", "local" },
+                        { "command", cmdArray },
+                        { "enabled", true },
+                        { "environment", env },
+                    };
+                }
+                case Envelope.ZcodeStdio:
+                    return new Dictionary<string, object>
+                    {
+                        { "type", "stdio" },
+                        { "command", command },
+                        { "args", argsList },
+                        { "env", env },
+                    };
+                default:
+                    return new Dictionary<string, object>
+                    {
+                        { "command", command },
+                        { "args", argsList },
+                        { "env", env },
+                    };
+            }
+        }
+
+        /// <summary>
+        /// Render the <c>claude mcp add</c> CLI command for the Claude Code
+        /// client. Matches the Hub Rust <c>claude_mcp_add_command</c>.
+        /// </summary>
+        public static string ClaudeMcpAddCommand(string unityProjectPath, int bridgePort, string command, IReadOnlyList<string> args)
+        {
+            var invocation = new StringBuilder();
+            invocation.Append(command);
+            foreach (var a in args)
+            {
+                invocation.Append(' ').Append(a);
+            }
+            return string.Format(
+                "claude mcp add {0} --env {1}={2} --env {3}={4} -- {5}",
+                ServerKey,
+                BridgeConstants.ProjectPathEnvVar, unityProjectPath,
+                BridgeConstants.PortEnvVar, bridgePort,
+                invocation);
+        }
+
+        /// <summary>
+        /// Portable <c>claude mcp add</c>: no env pairs, and
+        /// <c>--scope project</c> so Claude Code writes the workspace
+        /// <c>.mcp.json</c> the team commits. Matches the Hub Rust
+        /// <c>claude_mcp_add_command_portable</c>.
+        /// </summary>
+        public static string ClaudeMcpAddCommandPortable(string command, IReadOnlyList<string> args)
+        {
+            var sb = new StringBuilder("claude mcp add --scope project ");
+            sb.Append(ServerKey).Append(" -- ").Append(command);
+            foreach (var a in args) sb.Append(' ').Append(ShellQuote(a));
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Quote one argument for the shell the operator pastes the command
+        /// into: a Unity subfolder with a space (<c>My Client</c>) must stay
+        /// one <c>--unity-subpath</c> value. Double quotes are understood by
+        /// POSIX shells, PowerShell and cmd alike; anything without whitespace
+        /// or quotes is left bare so the common case reads as documented.
+        /// </summary>
+        internal static string ShellQuote(string arg)
+        {
+            if (string.IsNullOrEmpty(arg)) return "\"\"";
+            var needsQuotes = false;
+            foreach (var c in arg)
+            {
+                if (char.IsWhiteSpace(c) || c == '"')
+                {
+                    needsQuotes = true;
+                    break;
+                }
+            }
+            if (!needsQuotes) return arg;
+            return "\"" + arg.Replace("\"", "\\\"") + "\"";
+        }
+
+        /// <summary>
+        /// Target config file for a portable entry: the client's project
+        /// template under the workspace root. <c>null</c> for CLI/manual clients.
+        /// </summary>
+        public static string ResolvePortableTargetPath(ClientEntry client, PortablePlacement placement)
+        {
+            if (!client.IsFileBacked || client.PathTemplate == null) return null;
+            return Path.Combine(placement.WorkspaceRoot, client.PathTemplate).Replace('\\', '/');
+        }
+
+        /// <summary>
+        /// Resolve the on-disk target path for display. Global paths with
+        /// <c>$HOME</c> are resolved against the user profile dir (or
+        /// <paramref name="homePath"/>, which exists so the policy is
+        /// testable). Clients whose global path is OS-specific resolve through
+        /// <see cref="ResolveOsPath"/>. Returns <c>null</c> for
+        /// CLI/clipboard-only clients.
+        /// </summary>
+        public static string ResolveDisplayPath(ClientEntry client, string projectPath, string homePath = null)
+        {
+            var home = homePath ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (client.PathTemplate == null)
+            {
+                return client.OsPathKind == OsPath.None ? null : ResolveOsPath(client.OsPathKind, home);
+            }
+            var p = client.PathTemplate.Replace("$HOME", home);
+            if (client.ScopeKind == Scope.Project)
+            {
+                return Path.Combine(projectPath, p).Replace('\\', '/');
+            }
+            return p.Replace('\\', '/');
+        }
+
+        /// <summary>
+        /// Absolute path for an OS-specific global client config. Ported from
+        /// the Hub wizard's Rust resolvers so both writers target the same
+        /// file; keep the two in step when a client moves its config.
+        /// </summary>
+        public static string ResolveOsPath(OsPath kind, string homePath = null)
+        {
+            var home = homePath ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            switch (kind)
+            {
+                case OsPath.ClaudeDesktop:
+                    return Path.Combine(AppConfigRoot(home), "Claude", "claude_desktop_config.json")
+                        .Replace('\\', '/');
+                case OsPath.Cline:
+                    // VS Code globalStorage of the Cline extension.
+                    return Path.Combine(
+                            AppConfigRoot(home), "Code", "User", "globalStorage",
+                            "saoudrizwan.claude-dev", "settings", "cline_mcp_settings.json")
+                        .Replace('\\', '/');
+                default:
+                    return null;
+            }
+        }
+
+        // Per-OS root for application config: %APPDATA% on Windows,
+        // ~/Library/Application Support on macOS, ~/.config elsewhere.
+        private static string AppConfigRoot(string home)
+        {
+#if UNITY_EDITOR_WIN
+            return Path.Combine(home, "AppData", "Roaming");
+#elif UNITY_EDITOR_OSX
+            return Path.Combine(home, "Library", "Application Support");
+#else
+            return Path.Combine(home, ".config");
+#endif
+        }
+
+        /// <summary>
+        /// Every path where this client's config could be configuring the given
+        /// Unity project, nearest first.
+        ///
+        /// For a project-scoped client that is the project folder followed by up
+        /// to <see cref="MaxAncestorLevels"/> ancestors, because the Unity
+        /// project is frequently a subfolder of the repository the agent was
+        /// opened on (<c>&lt;repo&gt;/Client</c>) and the client reads its
+        /// config relative to that repository root. Global-scope clients keep
+        /// their single absolute path, and CLI/manual clients have none.
+        ///
+        /// The walk stops before the home directory: <c>$HOME/.cursor/mcp.json</c>
+        /// and friends are already separate global-scope rows in
+        /// <see cref="Clients"/>, and treating them as a project config would
+        /// report every project on the machine as configured.
+        ///
+        /// Pure string math (no filesystem access) so the policy is
+        /// unit-testable; <paramref name="homePath"/> is injectable for the same
+        /// reason and defaults to the real user profile directory.
+        /// </summary>
+        public static string[] ResolveSearchPaths(
+            ClientEntry client,
+            string projectPath,
+            string homePath = null,
+            int maxAncestorLevels = MaxAncestorLevels)
+        {
+            if (client.ScopeKind != Scope.Project)
+            {
+                var single = ResolveDisplayPath(client, projectPath, homePath);
+                return single == null ? new string[0] : new[] { single };
+            }
+            if (client.PathTemplate == null) return new string[0];
+            if (string.IsNullOrEmpty(projectPath)) return new string[0];
+
+            var dirs = ResolveSearchDirectories(projectPath, homePath, maxAncestorLevels);
+            var results = new List<string>(dirs.Length);
+            foreach (var dir in dirs)
+            {
+                results.Add(Path.Combine(dir, client.PathTemplate).Replace('\\', '/'));
+            }
+            return results.ToArray();
+        }
+
+        /// <summary>
+        /// The directories a project-scoped config may live in, nearest first:
+        /// the Unity project folder and up to
+        /// <paramref name="maxAncestorLevels"/> ancestors, stopping before the
+        /// home directory and the filesystem root. Home is the boundary from
+        /// either side — it is excluded even when it IS the project root.
+        ///
+        /// Extracted from <see cref="ResolveSearchPaths"/> so everything that
+        /// walks up from a Unity project — client configs and the agent-facing
+        /// prose the updater rewrites — shares one boundary policy instead of
+        /// each re-deriving it.
+        /// </summary>
+        public static string[] ResolveSearchDirectories(
+            string projectPath,
+            string homePath = null,
+            int maxAncestorLevels = MaxAncestorLevels)
+        {
+            if (string.IsNullOrEmpty(projectPath)) return new string[0];
+
+            var home = NormalizeDir(
+                homePath ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+            var dirs = new List<string>();
+            var dir = NormalizeDir(projectPath);
+            for (var level = 0; dir != null && level <= maxAncestorLevels; level++)
+            {
+                // Home is the walk's boundary from either side: never a search
+                // directory itself, not even when the Unity project root IS
+                // home. `$HOME/.cursor/mcp.json` and friends are global-scope
+                // rows; probing one as a project config would claim a
+                // machine-wide file for whatever project is open (it dedupes
+                // ahead of the HomeConfig pass and looks project-owned).
+                if (!string.IsNullOrEmpty(home)
+                    && string.Equals(dir, home, StringComparison.OrdinalIgnoreCase))
+                {
+                    break;
+                }
+                dirs.Add(dir);
+                var parent = ParentDir(dir);
+                if (parent == null) break;
+                dir = parent;
+            }
+            return dirs.ToArray();
+        }
+
+        /// <summary>Forward-slash form with any trailing separator removed, so
+        /// parent/home comparisons are plain string comparisons.</summary>
+        private static string NormalizeDir(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return path;
+            var p = path.Replace('\\', '/');
+            while (p.Length > 1 && p[p.Length - 1] == '/') p = p.Substring(0, p.Length - 1);
+            return p;
+        }
+
+        /// <summary>Parent of a normalized directory, or <c>null</c> at a root
+        /// (<c>/</c> or a bare Windows drive) — a filesystem root is never worth
+        /// searching for a project config.</summary>
+        private static string ParentDir(string normalized)
+        {
+            if (string.IsNullOrEmpty(normalized)) return null;
+            var idx = normalized.LastIndexOf('/');
+            if (idx <= 0) return null;
+            var parent = normalized.Substring(0, idx);
+            if (parent.Length == 2 && parent[1] == ':') return null; // "C:"
+            return parent;
+        }
+
+        /// <summary>
+        /// Pure content check: does the target config file body already
+        /// contain a <c>unity-open-mcp</c> entry for this client's envelope?
+        /// Extracted from the Status panel's configured-detection so the
+        /// matching policy is unit-testable without the filesystem.
+        ///
+        /// For JSON envelopes, when <paramref name="mergeKey"/> is non-empty
+        /// the body must contain BOTH the merge key and the
+        /// <c>"unity-open-mcp"</c> server key. This avoids the worst false
+        /// positive — an entry pasted under the wrong section (e.g. under
+        /// <c>servers</c> for a client that reads <c>mcpServers</c>) reporting
+        /// as configured and silencing further troubleshooting. Codex (TOML)
+        /// matches on its table header; CLI/Manual envelopes never report
+        /// configured from file contents (they have no target file).
+        ///
+        /// A dotted merge key names nested objects (<c>mcp.servers</c> →
+        /// <c>{"mcp": {"servers": …}}</c>), so each segment is matched as its own
+        /// quoted JSON key. Matching the dotted string verbatim never hits: it
+        /// only appears in the catalog, never in a config file. Quoting also
+        /// stops <c>servers</c> from matching inside <c>"mcpServers"</c>.
+        /// </summary>
+        public static bool IsConfiguredEntry(Envelope envelope, string fileBody, string mergeKey = null)
+        {
+            if (string.IsNullOrEmpty(fileBody)) return false;
+            switch (envelope)
+            {
+                case Envelope.Codex:
+                    return fileBody.Contains("[mcp_servers.unity-open-mcp]");
+                case Envelope.CliOnly:
+                case Envelope.Manual:
+                    // No target file — never "configured" via content scan.
+                    return false;
+                default:
+                    // JSON clients: require the server key. When the client has a
+                    // known merge key, also require every segment of it so an
+                    // entry pasted under a different section (a common config
+                    // bug) is NOT reported as configured.
+                    if (!fileBody.Contains("\"unity-open-mcp\"")) return false;
+                    if (string.IsNullOrEmpty(mergeKey)) return true;
+                    foreach (var segment in mergeKey.Split('.'))
+                    {
+                        if (segment.Length == 0) continue;
+                        if (!fileBody.Contains("\"" + segment + "\"")) return false;
+                    }
+                    return true;
+            }
+        }
+
+        // --- envelope helpers -------------------------------------------------
+
+        private static Dictionary<string, string> EnvMap(string project, int port)
+        {
+            return new Dictionary<string, string>
+            {
+                { BridgeConstants.ProjectPathEnvVar, project },
+                { BridgeConstants.PortEnvVar, port.ToString() },
+            };
+        }
+
+        /// <summary>
+        /// Build a nested JSON object from a merge key + leaf entry fields.
+        /// Constructs the object tree then serializes once.
+        /// </summary>
+        private static string BuildNestedJson(string[] mergeKeySegments, string leafKey, Dictionary<string, object> entryFields)
+        {
+            var root = new Dictionary<string, object>();
+            var node = root;
+            foreach (var seg in mergeKeySegments)
+            {
+                var child = new Dictionary<string, object>();
+                node[seg] = child;
+                node = child;
+            }
+            node[leafKey] = entryFields;
+            return SerializeJson(root);
+        }
+
+        /// <summary>Pretty-print an arbitrary object tree (dict / list / scalar).</summary>
+        private static string SerializeJson(object value)
+        {
+            var sb = new StringBuilder();
+            SerializeJsonInto(sb, value, 0);
+            return sb.ToString();
+        }
+
+        private static void SerializeJsonInto(StringBuilder sb, object value, int indent)
+        {
+            switch (value)
+            {
+                case null:
+                    sb.Append("null");
+                    break;
+                case bool b:
+                    sb.Append(b ? "true" : "false");
+                    break;
+                case string s:
+                    AppendJsonString(sb, s);
+                    break;
+                case Dictionary<string, object> dict:
+                {
+                    if (dict.Count == 0) { sb.Append("{}"); break; }
+                    sb.Append("{\n");
+                    var pad = new string(' ', (indent + 1) * 2);
+                    var closePad = new string(' ', indent * 2);
+                    var i = 0;
+                    foreach (var kv in dict)
+                    {
+                        sb.Append(pad).Append('"').Append(kv.Key).Append("\": ");
+                        SerializeJsonInto(sb, kv.Value, indent + 1);
+                        if (++i < dict.Count) sb.Append(',');
+                        sb.Append('\n');
+                    }
+                    sb.Append(closePad).Append('}');
+                    break;
+                }
+                case Dictionary<string, string> smap:
+                {
+                    if (smap.Count == 0) { sb.Append("{}"); break; }
+                    sb.Append("{\n");
+                    var pad = new string(' ', (indent + 1) * 2);
+                    var closePad = new string(' ', indent * 2);
+                    var i = 0;
+                    foreach (var kv in smap)
+                    {
+                        sb.Append(pad).Append('"').Append(kv.Key).Append("\": ");
+                        AppendJsonString(sb, kv.Value);
+                        if (++i < smap.Count) sb.Append(',');
+                        sb.Append('\n');
+                    }
+                    sb.Append(closePad).Append('}');
+                    break;
+                }
+                case IList<object> oarr:
+                {
+                    if (oarr.Count == 0) { sb.Append("[]"); break; }
+                    sb.Append("[\n");
+                    var pad = new string(' ', (indent + 1) * 2);
+                    var closePad = new string(' ', indent * 2);
+                    for (var i = 0; i < oarr.Count; i++)
+                    {
+                        sb.Append(pad);
+                        SerializeJsonInto(sb, oarr[i], indent + 1);
+                        if (i + 1 < oarr.Count) sb.Append(',');
+                        sb.Append('\n');
+                    }
+                    sb.Append(closePad).Append(']');
+                    break;
+                }
+                default:
+                    AppendJsonString(sb, value?.ToString() ?? "");
+                    break;
+            }
+        }
+
+        private static void AppendJsonString(StringBuilder sb, string s)
+        {
+            sb.Append('"');
+            foreach (var c in s)
+            {
+                switch (c)
+                {
+                    case '\\': sb.Append("\\\\"); break;
+                    case '"': sb.Append("\\\""); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (c < 0x20) sb.AppendFormat("\\u{0:x4}", (int)c);
+                        else sb.Append(c);
+                        break;
+                }
+            }
+            sb.Append('"');
+        }
+
+        private static string CodexTomlHeader(string command, IReadOnlyList<string> args)
+        {
+            var sb = new StringBuilder();
+            sb.Append("[mcp_servers.").Append(ServerKey).Append("]\n");
+            sb.Append("enabled = true\n");
+            sb.Append("command = ").Append(TomlString(command)).Append('\n');
+            sb.Append("args = [");
+            for (var i = 0; i < args.Count; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                sb.Append(TomlString(args[i]));
+            }
+            sb.Append("]\n");
+            return sb.ToString();
+        }
+
+        private static string CodexTomlEntry(string command, IReadOnlyList<string> args, string project, int port)
+        {
+            var sb = new StringBuilder(CodexTomlHeader(command, args));
+            sb.Append('\n');
+            sb.Append("[mcp_servers.").Append(ServerKey).Append(".env]\n");
+            sb.Append(BridgeConstants.ProjectPathEnvVar).Append(" = ").Append(TomlString(project)).Append('\n');
+            sb.Append(BridgeConstants.PortEnvVar).Append(" = ").Append(TomlString(port.ToString())).Append('\n');
+            return sb.ToString();
+        }
+
+        private static string TomlString(string s)
+        {
+            var sb = new StringBuilder("\"");
+            foreach (var c in s)
+            {
+                switch (c)
+                {
+                    case '\\': sb.Append("\\\\"); break;
+                    case '"': sb.Append("\\\""); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default: sb.Append(c); break;
+                }
+            }
+            sb.Append('"');
+            return sb.ToString();
+        }
+    }
+}

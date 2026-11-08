@@ -1,0 +1,27 @@
+{
+  "name": "com.alexeyperov.unity-open-mcp-bridge.MemoryProfiler.Editor",
+  "rootNamespace": "UnityOpenMcpBridge.Extensions.MemoryProfilerExt",
+  "references": [
+    "com.alexeyperov.unity-open-mcp-bridge.Editor",
+    "Unity.MemoryProfiler.Editor"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [
+    "UNITY_OPEN_MCP_EXT_MEMORYPROFILER"
+  ],
+  "versionDefines": [
+    {
+      "name": "com.unity.memoryprofiler",
+      "expression": "1.0.0",
+      "define": "UNITY_OPEN_MCP_EXT_MEMORYPROFILER"
+    }
+  ],
+  "noEngineReferences": false
+}

@@ -1,0 +1,63 @@
+using System.Text;
+using UnityOpenMcpVerify;
+
+namespace UnityOpenMcpBridge.MetaTools
+{
+    public static class FindReferencesTool
+    {
+        public static ToolDispatchResult Execute(string body)
+        {
+            var assetPath = JsonBody.GetString(body, "asset_path");
+            var guid = JsonBody.GetString(body, "guid");
+            var maxResults = JsonBody.GetInt(body, "max_results", 100);
+
+            if (string.IsNullOrEmpty(assetPath) && string.IsNullOrEmpty(guid))
+                return ToolDispatchResult.Fail("missing_parameter",
+                    "Either 'asset_path' or 'guid' is required.");
+
+            var input = !string.IsNullOrEmpty(assetPath) ? assetPath : guid;
+
+            FindReferencesResult result;
+            try
+            {
+                result = VerifyGateAdapter.FindReferences(input, maxResults);
+            }
+            catch (System.Exception e)
+            {
+                return ToolDispatchResult.Fail("reference_error", e.Message);
+            }
+
+            return ToolDispatchResult.Ok(BuildResult(result));
+        }
+
+        private static string BuildResult(FindReferencesResult result)
+        {
+            var sb = new StringBuilder(1024);
+
+            sb.Append("{\"queriedAssetPath\":");
+            sb.Append(BridgeJson.EscapeString(result.QueriedAssetPath));
+            sb.Append(",\"queriedAssetGuid\":");
+            sb.Append(BridgeJson.EscapeString(result.QueriedAssetGuid));
+
+            sb.Append(",\"referencedBy\":[");
+            if (result.ReferencedBy != null)
+            {
+                for (int i = 0; i < result.ReferencedBy.Length; i++)
+                {
+                    if (i > 0) sb.Append(',');
+                    var entry = result.ReferencedBy[i];
+                    sb.Append('{');
+                    sb.Append("\"assetPath\":").Append(BridgeJson.EscapeString(entry.AssetPath));
+                    sb.Append(",\"guid\":").Append(BridgeJson.EscapeString(entry.Guid));
+                    sb.Append('}');
+                }
+            }
+            sb.Append(']');
+
+            sb.Append(",\"totalCount\":").Append(result.TotalCount);
+            sb.Append('}');
+
+            return sb.ToString();
+        }
+    }
+}

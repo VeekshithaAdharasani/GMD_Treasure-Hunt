@@ -1,0 +1,21 @@
+{
+  "name": "com.alexeyperov.unity-open-mcp-bridge",
+  "displayName": "Unity Open MCP Bridge",
+  "version": "1.6.0",
+  "unity": "2022.3",
+  "description": "Live HTTP connector for Unity Open MCP. Exposes meta-tool dispatch and GatePolicy over localhost.",
+  "author": {
+    "name": "Alexey Perov",
+    "url": "https://github.com/AlexeyPerov/unity-open-mcp"
+  },
+  "keywords": [
+    "unity-open-mcp",
+    "mcp",
+    "bridge",
+    "ai"
+  ],
+  "dependencies": {
+    "com.alexeyperov.unity-open-mcp-verify": "1.6.0"
+  },
+  "_fingerprint": "7e942028a1cad9a68b5bc0b93fafbc9d111a78d9"
+}

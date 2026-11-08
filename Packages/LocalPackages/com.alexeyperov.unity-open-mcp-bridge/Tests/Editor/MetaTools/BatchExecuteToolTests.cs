@@ -1,0 +1,767 @@
+using System.Collections.Generic;
+using System.Text.RegularExpressions;
+using NUnit.Framework;
+using UnityEditor;
+using UnityEngine;
+using UnityOpenMcpBridge.MetaTools;
+using UnityOpenMcpBridge.ObjectRefs;
+
+namespace UnityOpenMcpBridge.Tests
+{
+    // M27 Plan 4 — BatchExecuteTool unit tests.
+    //
+    // Covers the Done-When items from execution-plan-4 T27.4.2:
+    //   - happy path (3× gameobject_create)
+    //   - fail_fast abort (skipped tail)
+    //   - over-limit rejection
+    //   - deny-listed nested tool
+    //   - fail_fast:false collects all per-step errors
+    //
+    // These call BatchExecuteTool.Execute(body) directly (no HTTP / queue), the
+    // same pattern as GameObjectsToolsTests. The batch-level gate cycle
+    // (BatchExecuteGateRunner) is exercised by the integration tests; here we
+    // assert the per-step envelope shape + dispatch reuse.
+    [TestFixture]
+    public class BatchExecuteToolTests
+    {
+        private const string CleanupPrefix = "__MCPTest_Batch_";
+
+        [TearDown]
+        public void TearDown()
+        {
+            // Destroy any GameObjects the batch steps created so the test
+            // scene stays clean between runs.
+            DestroyAllPrefixed();
+        }
+
+        // -------------------------------------------------------------------
+        // Validation: missing / empty commands array
+        // -------------------------------------------------------------------
+
+        [Test]
+        public void BatchOuterTransportTimeoutIsAccepted()
+        {
+            var result = BatchExecuteTool.Preflight("{\"commands\":[{\"tool\":\"unity_open_mcp_gameobject_find\",\"params\":{\"game_object_path\":\"Missing\"}}],\"timeout_ms\":30000}", out var mutating);
+            Assert.IsNull(result, result?.ErrorMessage);
+            Assert.IsFalse(mutating);
+        }
+
+        [Test]
+        public void CanonicalComponentSchemaMapsNestedPropertyWithoutChangingValue()
+        {
+            var schema = BridgeBatchSchemas.ByTool["unity_open_mcp_component_modify"];
+            const string body = "{\"game_object_path\":\"Main Camera\",\"component_type\":\"UnityEngine.Transform\",\"fields\":[{\"property_path\":\"m_LocalPosition\",\"value\":{\"path\":\"untouched\"}}],\"paths_hint\":[\"Assets/Main.unity\"]}";
+            var errors = new System.Collections.Generic.List<string>();
+            BatchSchemaValidator.ValidateRequest(body, schema, errors);
+            Assert.IsEmpty(errors);
+            var wire = BatchSchemaValidator.WireArguments(body, schema);
+            StringAssert.Contains("\"path\":\"Main Camera\"", wire);
+            StringAssert.Contains("\"type_name\":\"UnityEngine.Transform\"", wire);
+            StringAssert.Contains("\"path\":\"m_LocalPosition\"", wire);
+            StringAssert.Contains("\"value\":{\"path\":\"untouched\"}", wire);
+        }
+
+        [Test]
+        public void AliasConflictAndUnknownKeyRejectedBeforeDispatch()
+        {
+            var schema = BridgeBatchSchemas.ByTool["unity_open_mcp_gameobject_find"];
+            var errors = new System.Collections.Generic.List<string>();
+            BatchSchemaValidator.ValidateRequest("{\"path\":\"A\",\"game_object_path\":\"B\",\"typo\":true}", schema, errors);
+            Assert.GreaterOrEqual(errors.Count, 2);
+            StringAssert.Contains("game_object_path", string.Join(";", errors));
+            Assert.IsNotEmpty(BatchSchemaValidator.Deprecations("{\"path\":\"A\"}", schema));
+        }
+
+        [Test]
+        public void ExplicitNullForOptionalTypedArgumentReadsAsOmitted()
+        {
+            // Mirrors tool-contract.ts: clients serialize absent optionals as
+            // null. A required key, an untyped patch value and a type that
+            // lists "null" keep the value as sent.
+            const string schema = "{\"type\":\"object\",\"required\":[\"name\"],\"properties\":{\"name\":{\"type\":\"string\"},\"parent_path\":{\"type\":\"string\"},\"value\":{},\"count\":{\"type\":[\"integer\",\"null\"]}},\"additionalProperties\":false}";
+            var errors = new List<string>();
+            BatchSchemaValidator.ValidateRequest("{\"name\":\"Foo\",\"parent_path\":null,\"value\":null,\"count\":null}", schema, errors);
+            Assert.IsEmpty(errors, string.Join("; ", errors));
+
+            errors.Clear();
+            BatchSchemaValidator.ValidateRequest("{\"name\":null}", schema, errors);
+            StringAssert.Contains("args.name must be string", string.Join("; ", errors));
+
+            // The waived null never reaches the tool; kept nulls do.
+            Assert.AreEqual("{\"name\":\"Foo\",\"value\":null,\"count\":null}",
+                BatchSchemaValidator.WireArguments("{\"name\":\"Foo\",\"parent_path\":null,\"value\":null,\"count\":null}", schema));
+
+            // A generated tool schema: a null selector alias neither conflicts nor counts as supplied.
+            var component = BridgeBatchSchemas.ByTool["unity_open_mcp_component_get"];
+            errors.Clear();
+            BatchSchemaValidator.ValidateRequest("{\"game_object_path\":\"Root/Child\",\"path\":null,\"component_type\":\"UnityEngine.Transform\"}", component, errors);
+            Assert.IsEmpty(errors, string.Join("; ", errors));
+        }
+
+        [Test]
+        public void GameObjectModify_NameIsPayload_NameTargetIsSelector()
+        {
+            var schema = BridgeBatchSchemas.ByTool["unity_open_mcp_gameobject_modify"];
+            var errors = new List<string>();
+            BatchSchemaValidator.ValidateRequest(
+                "{\"path\":\"Root/Player\",\"name\":\"Hero\",\"paths_hint\":[\"Assets/Main.unity\"]}", schema, errors);
+            Assert.IsEmpty(errors, string.Join("; ", errors));
+
+            errors.Clear();
+            BatchSchemaValidator.ValidateRequest(
+                "{\"path\":\"Root/Player\",\"name_target\":\"Player\",\"paths_hint\":[\"Assets/Main.unity\"]}", schema, errors);
+            StringAssert.Contains("only one GameObject selector", string.Join("; ", errors));
+
+            // Nested batch steps use the same generated schema.
+            var result = BatchExecuteTool.Preflight(
+                "{\"commands\":[{\"tool\":\"unity_open_mcp_gameobject_modify\",\"params\":{\"path\":\"Root/Player\",\"name\":\"Hero\"}}]," +
+                "\"paths_hint\":[\"Assets/Main.unity\"]}", out _);
+            Assert.IsNull(result, result?.ErrorMessage);
+
+            // Other GameObject hosts keep `name` as a selector.
+            errors.Clear();
+            BatchSchemaValidator.ValidateRequest("{\"path\":\"A\",\"name\":\"B\"}",
+                BridgeBatchSchemas.ByTool["unity_open_mcp_gameobject_find"], errors);
+            StringAssert.Contains("only one GameObject selector", string.Join("; ", errors));
+        }
+
+        [Test]
+        public void OneOfRequiredOnlyBranches_SelectExactlyOneLocator()
+        {
+            var schema = BridgeBatchSchemas.ByTool["unity_open_mcp_find_references"];
+            var errors = new List<string>();
+            BatchSchemaValidator.ValidateRequest("{\"asset_path\":\"Assets/A.prefab\",\"profile\":\"compact\"}", schema, errors);
+            Assert.IsEmpty(errors, string.Join("; ", errors));
+
+            errors.Clear();
+            BatchSchemaValidator.ValidateRequest("{\"guid\":\"0123456789abcdef0123456789abcdef\"}", schema, errors);
+            Assert.IsEmpty(errors, string.Join("; ", errors));
+
+            errors.Clear();
+            BatchSchemaValidator.ValidateRequest("{\"asset_path\":\"Assets/A.prefab\",\"guid\":\"0123456789abcdef0123456789abcdef\"}", schema, errors);
+            StringAssert.Contains("oneOf", string.Join("; ", errors));
+        }
+
+        [Test]
+        public void Execute_MissingCommands_ReturnsMissingParameter()
+        {
+            var result = BatchExecuteTool.Execute("{}");
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual("missing_parameter", result.ErrorCode);
+            StringAssert.Contains("'commands'", result.ErrorMessage);
+        }
+
+        [Test]
+        public void Execute_EmptyCommands_ReturnsMissingParameter()
+        {
+            var result = BatchExecuteTool.Execute("{\"commands\":[]}");
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual("missing_parameter", result.ErrorCode);
+        }
+
+        // -------------------------------------------------------------------
+        // Over-limit rejection
+        // -------------------------------------------------------------------
+
+        [Test]
+        public void Execute_OverLimit_ReturnsBatchTooManyCommands()
+        {
+            // Build a commands array that exceeds the HARD MAX (100) so the test
+            // is deterministic regardless of the project's batchExecuteMaxCommands
+            // setting (which could be raised up to 100 in settings.json).
+            var cmds = new List<string>();
+            for (int i = 0; i < 101; i++)
+            {
+                cmds.Add("{\"tool\":\"unity_open_mcp_gameobject_find\",\"params\":{}}");
+            }
+            var body = "{\"commands\":[" + string.Join(",", cmds) + "]}";
+
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual("batch_too_many_commands", result.ErrorCode);
+            StringAssert.Contains("limit", result.ErrorMessage);
+        }
+
+        // -------------------------------------------------------------------
+        // Deny-listed nested tool
+        // -------------------------------------------------------------------
+
+        [Test]
+        public void Execute_DenyListedNestedTool_ReturnsBatchToolNotInvokable()
+        {
+            // batch_execute cannot be nested inside itself.
+            var body = "{\"commands\":[{\"tool\":\"unity_open_mcp_batch_execute\",\"params\":{}}]}";
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual("batch_tool_not_invokable", result.ErrorCode);
+        }
+
+        [Test]
+        public void Execute_DenyListedPowerTool_ReturnsBatchToolNotInvokable()
+        {
+            // compile_check is headless-only and blocked in v1.
+            var body = "{\"commands\":[{\"tool\":\"unity_open_mcp_compile_check\",\"params\":{}}]}";
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual("batch_tool_not_invokable", result.ErrorCode);
+        }
+
+        // -------------------------------------------------------------------
+        // T5.2 — RestartThenSettle lifecycle tools are denied as nested steps
+        // (domain reload / scene switch would silently abort remaining steps).
+        // -------------------------------------------------------------------
+
+        [Test]
+        public void Execute_PackageAdd_RefusedAsNestedReloadUnsafe()
+        {
+            var body = "{\"commands\":[{\"tool\":\"unity_open_mcp_package_add\",\"params\":{\"package_id\":\"com.unity.test\"}}]}";
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual("batch_nested_reload_unsafe", result.ErrorCode);
+            StringAssert.Contains("package_add", result.ErrorMessage);
+            StringAssert.Contains("restart_then_settle", result.ErrorMessage);
+        }
+
+        [Test]
+        public void Execute_SceneOpen_RefusedAsNestedReloadUnsafe()
+        {
+            var body = "{\"commands\":[{\"tool\":\"unity_open_mcp_scene_open\",\"params\":{\"path\":\"Assets/Foo.unity\"}}]}";
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual("batch_nested_reload_unsafe", result.ErrorCode);
+            StringAssert.Contains("scene_open", result.ErrorMessage);
+        }
+
+        [Test]
+        public void Execute_AsmdefModify_RefusedAsNestedReloadUnsafe()
+        {
+            var body = "{\"commands\":[{\"tool\":\"unity_open_mcp_asmdef_modify\",\"params\":{\"asset_path\":\"Assets/Foo.asmdef\"}}]}";
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual("batch_nested_reload_unsafe", result.ErrorCode);
+            StringAssert.Contains("asmdef_modify", result.ErrorMessage);
+        }
+
+        [Test]
+        public void Execute_ExecuteCsharp_RefusedAsNestedReloadUnsafe()
+        {
+            // execute_csharp is RestartThenSettle — now denied via the lifecycle
+            // path (batch_nested_reload_unsafe), not the old explicit deny-list.
+            var body = "{\"commands\":[{\"tool\":\"unity_open_mcp_execute_csharp\",\"params\":{\"code\":\"return 1;\"}}]}";
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual("batch_nested_reload_unsafe", result.ErrorCode);
+            StringAssert.Contains("execute_csharp", result.ErrorMessage);
+        }
+
+        [Test]
+        public void Execute_ReloadUnsafe_NamesTheOffendingStepIndex()
+        {
+            // A batch with a safe step before the unsafe one — the error must
+            // name commands[1] (the offending step).
+            var body = "{\"commands\":[" +
+                       "{\"tool\":\"unity_open_mcp_gameobject_find\",\"params\":{}}," +
+                       "{\"tool\":\"unity_open_mcp_package_remove\",\"params\":{\"package_id\":\"x\"}}" +
+                       "]}";
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual("batch_nested_reload_unsafe", result.ErrorCode);
+            StringAssert.Contains("commands[1]", result.ErrorMessage);
+        }
+
+        // -------------------------------------------------------------------
+        // specs/feedback.md 2026-08-24 — run_tests cannot be a batch step: its
+        // terminal result comes from the MCP server polling
+        // test-results-<runId>.json (a LiveClient.route special case), and the
+        // batch route has no poller. The field report's batch answered
+        // {status:"started"} and never anything else, while the step was
+        // reported success. It must be refused up-front instead.
+        // -------------------------------------------------------------------
+
+        [Test]
+        public void Execute_RunTests_RefusedAsServerPolled()
+        {
+            var body = "{\"commands\":[{\"tool\":\"unity_senses_run_tests\",\"params\":" +
+                       "{\"play_mode\":false,\"assembly_name\":\"GameTests\"}}]}";
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual("batch_step_requires_server_poll", result.ErrorCode);
+            StringAssert.Contains("unity_senses_run_tests", result.ErrorMessage);
+            StringAssert.Contains("commands[0]", result.ErrorMessage);
+            // The refusal must name the route that DOES work.
+            StringAssert.Contains("top-level", result.ErrorMessage);
+        }
+
+        [Test]
+        public void Execute_Gesture_RefusedAsServerPolled()
+        {
+            // inputsim_gesture only starts an operation on the play-mode
+            // scheduler; the MCP server polls it to a terminal trace, and no
+            // frame can advance while the batch holds the main thread.
+            var body = "{\"commands\":[{\"tool\":\"unity_open_mcp_inputsim_gesture\",\"params\":" +
+                       "{\"fingers\":[{\"path\":[{\"at_ms\":0,\"x\":1,\"y\":1},{\"at_ms\":10,\"x\":1,\"y\":1}]}]}}]}";
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual("batch_step_requires_server_poll", result.ErrorCode);
+            StringAssert.Contains("unity_open_mcp_inputsim_gesture", result.ErrorMessage);
+            StringAssert.Contains("top-level", result.ErrorMessage);
+        }
+
+        [Test]
+        public void Execute_RunTests_RefusalNamesAReachableAlternative()
+        {
+            // The whole point of the field report: "use it as a single top-level
+            // call" is a dead end for a client that cannot see the tool at all
+            // (it ignored tools/list_changed after manage_tools activated the
+            // group). The refusal must also name something reachable from the
+            // always-visible core group.
+            var body = "{\"commands\":[{\"tool\":\"unity_senses_run_tests\",\"params\":{}}]}";
+            var result = BatchExecuteTool.Execute(body);
+            Assert.AreEqual("batch_step_requires_server_poll", result.ErrorCode);
+            StringAssert.Contains("invoke_method", result.ErrorMessage);
+            StringAssert.Contains("execute_csharp", result.ErrorMessage);
+        }
+
+        [Test]
+        public void Execute_RunTests_RefusedBeforeAnyOtherStepRuns()
+        {
+            // Pre-flight classification means the refusal happens BEFORE the
+            // dispatch loop, so a safe leading step must not have executed.
+            var name = CleanupPrefix + "PreflightGuard";
+            var body = "{\"commands\":[" +
+                       "{\"tool\":\"unity_open_mcp_gameobject_create\",\"params\":{\"name\":\"" + name + "\"}}," +
+                       "{\"tool\":\"unity_senses_run_tests\",\"params\":{}}" +
+                       "]}";
+            var result = BatchExecuteTool.Execute(body);
+            Assert.AreEqual("batch_step_requires_server_poll", result.ErrorCode);
+            StringAssert.Contains("commands[1]", result.ErrorMessage);
+            Assert.IsNull(GameObject.Find(name),
+                "A pre-flight refusal must commit nothing — the leading step must not have run.");
+        }
+
+        [Test]
+        public void Execute_RecompileScripts_RefusalNamesTheExecuteCsharpEquivalent()
+        {
+            // recompile_scripts is RestartThenSettle, so it is refused by the
+            // lifecycle guard — but the refusal used to point only at a
+            // top-level call the reporting client could not make. It must now
+            // also carry the concrete execute_csharp equivalent.
+            var body = "{\"commands\":[{\"tool\":\"unity_open_mcp_recompile_scripts\",\"params\":{}}]}";
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual("batch_nested_reload_unsafe", result.ErrorCode);
+            StringAssert.Contains("RequestScriptCompilation", result.ErrorMessage);
+            StringAssert.Contains("editor_status", result.ErrorMessage);
+        }
+
+        [Test]
+        public void Execute_ReloadUnsafeWithoutAlternative_KeepsTheBaseRefusal()
+        {
+            // Tools with no honest one-liner equivalent must NOT get a made-up
+            // workaround appended — the base refusal stands alone.
+            var body = "{\"commands\":[{\"tool\":\"unity_open_mcp_package_add\",\"params\":{\"package_id\":\"com.unity.test\"}}]}";
+            var result = BatchExecuteTool.Execute(body);
+            Assert.AreEqual("batch_nested_reload_unsafe", result.ErrorCode);
+            Assert.IsFalse(result.ErrorMessage.Contains("execute_csharp"),
+                "No fabricated alternative for a tool that has none: " + result.ErrorMessage);
+        }
+
+        // -------------------------------------------------------------------
+        // Review follow-up — scene_create is EditorSettle (no domain reload),
+        // so IsNestedReloadUnsafe does NOT catch it. But its default Single
+        // mode replaces the active scene stack. The param-aware guard refuses
+        // Single/default scene_create; additive is allowed.
+        // -------------------------------------------------------------------
+
+        [Test]
+        public void Execute_SceneCreate_DefaultMode_RefusedAsNestedReloadUnsafe()
+        {
+            // No mode → defaults to Single → replaces the scene stack.
+            var body = "{\"commands\":[{\"tool\":\"unity_open_mcp_scene_create\",\"params\":{\"path\":\"Assets/__MCPTest_Scene.unity\"}}]}";
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual("batch_nested_reload_unsafe", result.ErrorCode);
+            StringAssert.Contains("scene_create", result.ErrorMessage);
+            StringAssert.Contains("Single mode", result.ErrorMessage);
+        }
+
+        [Test]
+        public void Execute_SceneCreate_SingleMode_RefusedAsNestedReloadUnsafe()
+        {
+            // Explicit Single mode is refused for the same reason.
+            var body = "{\"commands\":[{\"tool\":\"unity_open_mcp_scene_create\",\"params\":{\"path\":\"Assets/__MCPTest_Scene.unity\",\"mode\":\"single\"}}]}";
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual("batch_nested_reload_unsafe", result.ErrorCode);
+            StringAssert.Contains("scene_create", result.ErrorMessage);
+        }
+
+        [Test]
+        public void Execute_SceneCreate_AdditiveMode_NotRefusedBySceneStackGuard()
+        {
+            // Additive mode preserves the scene stack and must pass the
+            // scene-stack guard. It may still fail later for unrelated
+            // asset-path reasons, but it must NOT fail with the scene-stack
+            // batch_nested_reload_unsafe error.
+            var body = "{\"commands\":[{\"tool\":\"unity_open_mcp_scene_create\",\"params\":{\"path\":\"Assets/__MCPTest_Scene_Additive.unity\",\"mode\":\"additive\"}}]}";
+            var result = BatchExecuteTool.Preflight(body, out _);
+            // The scene-stack guard specifically must not have fired.
+            Assert.IsNull(result,
+                "Additive scene_create must not be refused by the scene-stack guard. " +
+                "Got: " + result?.ErrorCode + " — " + result?.ErrorMessage);
+        }
+
+        // -------------------------------------------------------------------
+        // feedback-fable-31-07 §3 — a script_write step (file_path ending in
+        // .cs) followed by an import-trigger step (assets_refresh) must be
+        // refused up-front: the import arms a compile mid-batch, which can
+        // kill the HTTP response via a domain reload before the result is
+        // sent. The script_write step's param is `file_path` (the same key
+        // script_write/script_read read) — an earlier revision read `path`
+        // and the guard never fired.
+        // -------------------------------------------------------------------
+
+        [Test]
+        public void Execute_ScriptWriteFilePath_ThenAssetsRefresh_RefusedAsCombo()
+        {
+            // script_write's param is `file_path`, not `path`. The combo guard
+            // must read the right key or it never fires (regression guard).
+            var body = "{\"commands\":[" +
+                       "{\"tool\":\"unity_open_mcp_script_write\",\"params\":{\"file_path\":\"Assets/__MCPTest_Combo.cs\",\"content\":\"// x\"}}," +
+                       "{\"tool\":\"unity_open_mcp_assets_refresh\",\"params\":{}}" +
+                       "]}";
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual("batch_nested_reload_unsafe", result.ErrorCode);
+            StringAssert.Contains("commands[0] writes a script", result.ErrorMessage);
+            StringAssert.Contains("commands[1]", result.ErrorMessage);
+            // The offending import-trigger step must be named.
+            StringAssert.Contains("assets_refresh", result.ErrorMessage);
+        }
+
+        [Test]
+        public void Execute_ScriptWriteLegacyPathKey_DoesNotTriggerComboGuard()
+        {
+            // A script_write step that uses a wrong/legacy `path` key (instead
+            // of `file_path`) must NOT trip the combo guard: script_write
+            // itself will reject the missing `file_path` at dispatch, but the
+            // pre-flight combo check is keyed on the real param. This pins
+            // that the guard reads the same key the handler does.
+            var body = "{\"commands\":[" +
+                       "{\"tool\":\"unity_open_mcp_script_write\",\"params\":{\"path\":\"Assets/__MCPTest_Combo.cs\",\"content\":\"// x\"}}," +
+                       "{\"tool\":\"unity_open_mcp_assets_refresh\",\"params\":{}}" +
+                       "]}";
+            var result = BatchExecuteTool.Execute(body);
+            // The combo guard must NOT fire (it reads file_path, which is
+            // absent here). The batch proceeds; assets_refresh itself is a
+            // valid nested step, and script_write will report its own
+            // missing_parameter per-step.
+            Assert.AreNotEqual("batch_nested_reload_unsafe", result.ErrorCode,
+                "Combo guard must read `file_path`, not `path`. Got: " + result.ErrorCode);
+        }
+
+        [Test]
+        public void Preflight_ComboNamesRequestIndices_WhenAnUnknownStepIsLeftOutOfThePlan()
+        {
+            // The unknown tool at commands[1] is never planned, so the combo
+            // rule sees a two-step plan. It must still name the steps by their
+            // position in the REQUEST, and report alongside the other refusals.
+            var body = "{\"commands\":[" +
+                       "{\"tool\":\"unity_open_mcp_script_write\",\"params\":{\"file_path\":\"Assets/__MCPTest_Combo.cs\",\"content\":\"// x\"}}," +
+                       "{\"tool\":\"unity_open_mcp_not_a_real_tool\",\"params\":{}}," +
+                       "{\"tool\":\"unity_open_mcp_assets_refresh\",\"params\":{}}" +
+                       "]}";
+            var result = BatchExecuteTool.Preflight(body, out _);
+            Assert.IsNotNull(result);
+            StringAssert.Contains("commands[0] writes a script and commands[2]", result.ErrorMessage);
+            StringAssert.Contains("commands[1] tool 'unity_open_mcp_not_a_real_tool' is not available", result.ErrorMessage);
+        }
+
+        [Test]
+        public void Preflight_StepRefusalNamesItsOwnIndex()
+        {
+            // Per-step refusals take the index as a parameter; no message text
+            // is rewritten, so a later step is never reported as commands[0].
+            var body = "{\"commands\":[" +
+                       "{\"tool\":\"unity_open_mcp_assets_refresh\",\"params\":{}}," +
+                       "{\"tool\":\"unity_open_mcp_assets_refresh\",\"params\":{}}," +
+                       "{\"tool\":\"unity_open_mcp_compile_check\",\"params\":{}}" +
+                       "]}";
+            var result = BatchExecuteTool.Preflight(body, out _);
+            Assert.IsNotNull(result);
+            Assert.AreEqual("batch_tool_not_invokable", result.ErrorCode);
+            StringAssert.Contains("commands[2] tool 'unity_open_mcp_compile_check' is not invokable inside a batch", result.ErrorMessage);
+            StringAssert.DoesNotContain("commands[0] tool 'unity_open_mcp_compile_check'", result.ErrorMessage);
+        }
+
+        [Test]
+        public void Preflight_AbsentParamsIsEmptyObject_ExplicitNullIsRejected()
+        {
+            // Omitted params means "no arguments". An explicit null is rejected,
+            // matching the published schema (params is an object) and the MCP
+            // server's own pre-dispatch validation.
+            Assert.IsNull(BatchExecuteTool.Preflight(
+                "{\"commands\":[{\"tool\":\"unity_open_mcp_assets_refresh\"}]}", out _));
+            var rejected = BatchExecuteTool.Preflight(
+                "{\"commands\":[{\"tool\":\"unity_open_mcp_assets_refresh\",\"params\":null}]}", out _);
+            Assert.IsNotNull(rejected);
+            Assert.AreEqual("batch_invalid_step", rejected.ErrorCode);
+            StringAssert.Contains("commands[0].params must be object", rejected.ErrorMessage);
+        }
+
+        // -------------------------------------------------------------------
+        // Happy path: 3× gameobject_create
+        // -------------------------------------------------------------------
+
+        [Test]
+        public void Execute_ThreeGameObjects_AllSucceed()
+        {
+            var body = "{\"commands\":[" +
+                       "{\"tool\":\"unity_open_mcp_gameobject_create\",\"params\":{\"name\":\"" + CleanupPrefix + "A\"}}," +
+                       "{\"tool\":\"unity_open_mcp_gameobject_create\",\"params\":{\"name\":\"" + CleanupPrefix + "B\"}}," +
+                       "{\"tool\":\"unity_open_mcp_gameobject_create\",\"params\":{\"name\":\"" + CleanupPrefix + "C\"}}" +
+                       "]}";
+
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsTrue(result.Success, result.ErrorMessage);
+            // Batch envelope shape.
+            StringAssert.Contains("\"batch\":{", result.Output);
+            StringAssert.Contains("\"callSuccessCount\":3", result.Output);
+            StringAssert.Contains("\"callFailureCount\":0", result.Output);
+            // All three statuses are success.
+            Assert.AreEqual(3, Regex.Matches(result.Output, "\"status\":\"success\"").Count);
+            // The GameObjects were actually created.
+            Assert.IsNotNull(GameObject.Find(CleanupPrefix + "A"));
+            Assert.IsNotNull(GameObject.Find(CleanupPrefix + "B"));
+            Assert.IsNotNull(GameObject.Find(CleanupPrefix + "C"));
+        }
+
+        // -------------------------------------------------------------------
+        // fail_fast: true (default) — stops on first failure, rest skipped
+        // -------------------------------------------------------------------
+
+        [Test]
+        public void Execute_FailFastTrue_StopsOnFirstFailure()
+        {
+            // Step 0 succeeds; step 1 fails (empty name → missing_parameter);
+            // step 2 must be skipped (not executed).
+            var body = "{\"commands\":[" +
+                       "{\"tool\":\"unity_open_mcp_gameobject_create\",\"params\":{\"name\":\"" + CleanupPrefix + "OK\"}}," +
+                       "{\"tool\":\"unity_open_mcp_gameobject_create\",\"params\":{\"name\":\"\"}}," +
+                       "{\"tool\":\"unity_open_mcp_gameobject_create\",\"params\":{\"name\":\"" + CleanupPrefix + "Skipped\"}}" +
+                       "],\"fail_fast\":true}";
+
+            var result = BatchExecuteTool.Execute(body);
+            // Batch-level success is false because one step failed.
+            Assert.IsFalse(result.Success);
+            StringAssert.Contains("\"callSuccessCount\":1", result.Output);
+            StringAssert.Contains("\"callFailureCount\":1", result.Output);
+            // Step 1 failed.
+            StringAssert.Contains("\"status\":\"failed\"", result.Output);
+            StringAssert.Contains("\"missing_parameter\"", result.Output);
+            // Step 2 was skipped (not created).
+            StringAssert.Contains("\"status\":\"skipped\"", result.Output);
+            Assert.IsNull(GameObject.Find(CleanupPrefix + "Skipped"));
+        }
+
+        // -------------------------------------------------------------------
+        // fail_fast: false — runs every step, collects per-step errors
+        // -------------------------------------------------------------------
+
+        [Test]
+        public void Execute_FailFastFalse_RunsAllAndCollectsErrors()
+        {
+            // Step 0 fails; step 1 succeeds; step 2 fails. With fail_fast:false
+            // all three run and we see 2 failures + 1 success.
+            var body = "{\"commands\":[" +
+                       "{\"tool\":\"unity_open_mcp_gameobject_create\",\"params\":{\"name\":\"\"}}," +
+                       "{\"tool\":\"unity_open_mcp_gameobject_create\",\"params\":{\"name\":\"" + CleanupPrefix + "OK2\"}}," +
+                       "{\"tool\":\"unity_open_mcp_gameobject_create\",\"params\":{\"name\":\"\"}}" +
+                       "],\"fail_fast\":false}";
+
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsFalse(result.Success);
+            StringAssert.Contains("\"callSuccessCount\":1", result.Output);
+            StringAssert.Contains("\"callFailureCount\":2", result.Output);
+            // No skipped entries — every step ran.
+            Assert.AreEqual(0, Regex.Matches(result.Output, "\"status\":\"skipped\"").Count);
+            Assert.AreEqual(2, Regex.Matches(result.Output, "\"status\":\"failed\"").Count);
+            // The middle step's GameObject was created despite surrounding failures.
+            Assert.IsNotNull(GameObject.Find(CleanupPrefix + "OK2"));
+        }
+
+        // -------------------------------------------------------------------
+        // Regression: code-review finding B1 — BatchExecuteTool.Execute used to
+        // return ToolDispatchResult.Ok(...) unconditionally, so a partial batch
+        // (one or more failed steps) reported `mutation.success: true` to the
+        // gate envelope. That made BatchExecuteGateRunner's "one or more steps
+        // failed" guidance branch dead code and reported `gate.outcome: passed`
+        // for a run that had failed steps. The fix propagates batchSuccess to
+        // the dispatch result's Success flag with a `batch_partial_failure`
+        // error code, while the per-step output envelope is preserved so the
+        // agent can still inspect batch.results[].
+        // -------------------------------------------------------------------
+
+        [Test]
+        public void Execute_PartialFailure_SetsBatchPartialFailureErrorCode()
+        {
+            var body = "{\"commands\":[" +
+                       "{\"tool\":\"unity_open_mcp_gameobject_create\",\"params\":{\"name\":\"" + CleanupPrefix + "B1OK\"}}," +
+                       "{\"tool\":\"unity_open_mcp_gameobject_create\",\"params\":{\"name\":\"\"}}" +
+                       "]}";
+
+            var result = BatchExecuteTool.Execute(body);
+            // Success flag must reflect the partial failure (B1).
+            Assert.IsFalse(result.Success, "partial batch must report Success=false");
+            Assert.AreEqual("batch_partial_failure", result.ErrorCode);
+            Assert.IsNotNull(result.ErrorMessage);
+            StringAssert.Contains("batch.results[]", result.ErrorMessage);
+        }
+
+        [Test]
+        public void Execute_PartialFailure_StillPreservesBatchOutputEnvelope()
+        {
+            // The per-step detail must remain available in Output even when the
+            // batch failed — the agent inspects batch.results[] to recover.
+            var body = "{\"commands\":[" +
+                       "{\"tool\":\"unity_open_mcp_gameobject_create\",\"params\":{\"name\":\"" + CleanupPrefix + "B1Env\"}}," +
+                       "{\"tool\":\"unity_open_mcp_gameobject_create\",\"params\":{\"name\":\"\"}}" +
+                       "]}";
+
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsFalse(result.Success);
+            Assert.IsNotNull(result.Output);
+            StringAssert.Contains("\"batch\":{", result.Output);
+            StringAssert.Contains("\"success\":false", result.Output);
+            StringAssert.Contains("\"callSuccessCount\":1", result.Output);
+            StringAssert.Contains("\"callFailureCount\":1", result.Output);
+            // The whole output must be valid JSON (the error code is in the
+            // dispatch result, not duplicated into the body).
+            var parsed = JsonUtility.FromJson<BatchEnvelope>(result.Output);
+            Assert.IsFalse(parsed.batch.success);
+        }
+
+        [System.Serializable]
+        private class BatchEnvelope
+        {
+            public BatchPayload batch;
+        }
+
+        [System.Serializable]
+        private class BatchPayload
+        {
+            public bool success;
+            public int callSuccessCount;
+            public int callFailureCount;
+        }
+
+        // -------------------------------------------------------------------
+        // Per-step output is present on success
+        // -------------------------------------------------------------------
+
+        [Test]
+        public void Execute_SuccessStep_IncludesOutput()
+        {
+            var body = "{\"commands\":[" +
+                       "{\"tool\":\"unity_open_mcp_gameobject_create\",\"params\":{\"name\":\"" + CleanupPrefix + "Out\"}}" +
+                       "]}";
+
+            var result = BatchExecuteTool.Execute(body);
+            Assert.IsTrue(result.Success);
+            // The success step carries the nested tool's output (instanceId etc.).
+            StringAssert.Contains("\"output\":{", result.Output);
+            StringAssert.Contains("\"instanceId\":", result.Output);
+        }
+
+        // -------------------------------------------------------------------
+        // T1.1 — BatchExecuteGateRunner collapses the whole batch into ONE undo
+        // step. Pre-fix the collapse passed groupAfter (the latest group), which
+        // collapses nothing; post-fix it passes groupBefore so a single Ctrl+Z
+        // reverts the entire batch.
+        // -------------------------------------------------------------------
+
+        [Test]
+        public void GateRunner_TwoSteps_CollapseToSingleUndoEntry()
+        {
+            // Drive the runner with gate:"off" so the gate cycle short-circuits
+            // and we isolate the undo-group behavior. The runner's finally block
+            // (the collapse) runs regardless of the gate decision.
+            var body = "{\"commands\":[" +
+                       "{\"tool\":\"unity_open_mcp_gameobject_create\",\"params\":{\"name\":\"" + CleanupPrefix + "UndoA\"}}," +
+                       "{\"tool\":\"unity_open_mcp_gameobject_create\",\"params\":{\"name\":\"" + CleanupPrefix + "UndoB\"}}" +
+                       "]}";
+
+            GameObject objA = null, objB = null;
+            try
+            {
+                var result = BatchExecuteGateRunner.Execute(body, "off",
+                    new[] { "Assets/__BatchUndoTest.unity" });
+                Assert.IsTrue(result.Mutation.Success, result.Mutation.ErrorMessage);
+
+                objA = GameObject.Find(CleanupPrefix + "UndoA");
+                objB = GameObject.Find(CleanupPrefix + "UndoB");
+                Assert.IsNotNull(objA, "step 1 must create UndoA");
+                Assert.IsNotNull(objB, "step 2 must create UndoB");
+
+                // A single undo must revert the WHOLE batch (both creates),
+                // proving the per-step undos were collapsed into one entry.
+                Undo.PerformUndo();
+
+                Assert.IsNull(GameObject.Find(CleanupPrefix + "UndoA"),
+                    "one undo must revert UndoA (collapsed batch)");
+                Assert.IsNull(GameObject.Find(CleanupPrefix + "UndoB"),
+                    "one undo must revert UndoB (collapsed batch)");
+
+                // Mark null so TearDown / finally does not double-destroy.
+                objA = null;
+                objB = null;
+            }
+            finally
+            {
+                if (objA != null) Object.DestroyImmediate(objA);
+                if (objB != null) Object.DestroyImmediate(objB);
+            }
+        }
+
+        [Test]
+        public void GateRunner_NoOpBatch_DoesNotCollapse()
+        {
+            // A batch that produces NO undo entries (read-only find) must not
+            // call CollapseUndoOperations — groupAfter == groupBefore, and the
+            // guard skips the collapse. We assert the guard holds by checking
+            // the undo group count does not decrease after the runner returns.
+            int groupBefore = Undo.GetCurrentGroup();
+
+            var body = "{\"commands\":[" +
+                       "{\"tool\":\"unity_open_mcp_gameobject_find\",\"params\":{\"name\":\"" + CleanupPrefix + "NoopFind\"}}" +
+                       "]}";
+
+            var result = BatchExecuteGateRunner.Execute(body, "off",
+                new[] { "Assets/__BatchUndoTest.unity" });
+            // Find on a non-existent name returns success with notFound.
+            Assert.IsTrue(result.Mutation.Success, result.Mutation.ErrorMessage);
+
+            int groupAfter = Undo.GetCurrentGroup();
+            // A no-op batch (no Undo.RegisterCreatedObjectUndo / RecordObject)
+            // leaves the group index unchanged → no collapse.
+            Assert.AreEqual(groupBefore, groupAfter,
+                "a read-only batch must not advance or collapse the undo group");
+        }
+
+        // -------------------------------------------------------------------
+        // Helpers
+        // -------------------------------------------------------------------
+
+        private void DestroyAllPrefixed()
+        {
+            var all = SceneQuery.FindAllOfType<GameObject>(SceneQuery.Inactive.Exclude);
+            foreach (var go in all)
+            {
+                if (go != null && go.name != null && go.name.StartsWith(CleanupPrefix))
+                {
+                    Object.DestroyImmediate(go);
+                }
+            }
+        }
+    }
+}

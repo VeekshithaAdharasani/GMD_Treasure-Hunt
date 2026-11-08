@@ -1,0 +1,199 @@
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using UnityEditor;
+
+namespace UnityOpenMcpBridge.MetaTools
+{
+    public static class ExecuteMenuTool
+    {
+        // ExecuteMenuItem answers false both for an unknown path and for an
+        // item whose validate function rejected the current Editor state.
+        // UnityEditor.Menu.MenuItemExists (internal) tells the two apart;
+        // resolved once, and a runtime without it degrades to one combined
+        // "not found or disabled" answer.
+        private static readonly MethodInfo MenuItemExistsMethod = typeof(Menu).GetMethod(
+            "MenuItemExists",
+            BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic,
+            null,
+            new[] { typeof(string) },
+            null);
+
+        /// <summary>Whether a menu item with this exact path is registered; null when the Editor cannot say.</summary>
+        internal static bool? MenuItemExists(string menuPath)
+        {
+            if (MenuItemExistsMethod == null || string.IsNullOrEmpty(menuPath)) return null;
+            try { return MenuItemExistsMethod.Invoke(null, new object[] { menuPath }) as bool?; }
+            catch { return null; }
+        }
+
+        private static readonly HashSet<string> BlockedMenus = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "File/Quit"
+        };
+
+        private static readonly HashSet<string> ReadOnlyMenuAllowlist = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Assets/Refresh",
+            "Assets/Reveal in Finder",
+            "Assets/Show in Explorer",
+            "Edit/Selection",
+            "Edit/Project Settings",
+            "File/Open Scene",
+            "Window/General/Hierarchy",
+            "Window/General/Inspector",
+            "Window/General/Project",
+            "Window/General/Console",
+            "Window/General/Scene",
+            "Window/General/Game",
+            "Window/Layouts",
+            // feedback-04-08-opus §6 — play-mode control menus write NO project
+            // asset, so the gate (which checkpoints/validates ASSET paths) has
+            // nothing to scope. Forcing a fabricated paths_hint (e.g. a scene
+            // path) just to satisfy the mandatory-paths rule manufactured false
+            // scope AND triggered the scanner's scene-path console errors (§1)
+            // on every play/pause/step. These menus mutate editor RUNTIME state
+            // only, never Assets/.
+            "Edit/Play",
+            "Edit/Pause",
+            "Edit/Step",
+        };
+
+        // Batch-viable menu allow-list (M26 Plan 3). Most Editor menus open a
+        // window or dialog and fail under -batchmode (no UI). This is the
+        // conservative subset whose [MenuItem] handlers perform pure
+        // AssetDatabase / project work that does not require the Editor UI, so
+        // they succeed headless. Everything else is rejected with
+        // menu_not_viable_in_batchmode by the batch entry point so an agent
+        // gets a clear signal to connect a live Editor instead of a hung spawn.
+        private static readonly HashSet<string> BatchViableMenuAllowlist = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Assets/Refresh",
+            "Assets/Reimport All",
+            "File/Save Project",
+            "File/Save Scenes",
+        };
+
+        private static readonly HashSet<string> VerifierMenus = DiscoverVerifierMenus();
+
+        private static HashSet<string> DiscoverVerifierMenus()
+        {
+            var menus = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var method in TypeCache.GetMethodsWithAttribute<BridgeReadOnlyMenuAttribute>())
+                foreach (MenuItem menu in method.GetCustomAttributes(typeof(MenuItem), false))
+                    if (!menu.validate) menus.Add(menu.menuItem);
+            return menus;
+        }
+
+        public static bool IsNonDisruptiveReadOnlyMenu(string menuPath) =>
+            menuPath != null && (VerifierMenus.Contains(menuPath)
+                || menuPath == "Window/General/Hierarchy" || menuPath == "Window/General/Inspector"
+                || menuPath == "Window/General/Project" || menuPath == "Window/General/Console"
+                || menuPath == "Window/General/Scene" || menuPath == "Window/General/Game");
+
+        public static bool IsReadOnlyMenu(string menuPath)
+        {
+            if (string.IsNullOrEmpty(menuPath)) return false;
+            if (VerifierMenus.Contains(menuPath)) return true;
+            // Exact, case-insensitive match against the allow-list — OR a
+            // parent-segment match where the allow-listed entry is a real menu
+            // ancestor (e.g. allow-listing "Edit/Selection" covers the submenu
+            // "Edit/Selection/Select All"). The previous StartsWith check
+            // over-matched: any path prefixed by an allow-listed string
+            // (e.g. "Assets/Refresh XYZ") was treated as read-only. Matching on
+            // the "/" segment boundary keeps the parent-child behavior without
+            // the false positives.
+            foreach (var allowed in ReadOnlyMenuAllowlist)
+            {
+                if (menuPath.Equals(allowed, StringComparison.OrdinalIgnoreCase))
+                    return true;
+                if (menuPath.Length > allowed.Length
+                    && menuPath[allowed.Length] == '/'
+                    && menuPath.StartsWith(allowed + "/", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// M26 Plan 3 — is <paramref name="menuPath"/> on the batch-viable
+        /// allow-list? Only the conservative subset of Editor menus whose
+        /// handlers do pure AssetDatabase/project work (no window/dialog) are
+        /// permitted under -batchmode. The batch entry point gates on this and
+        /// returns <c>menu_not_viable_in_batchmode</c> for everything else.
+        /// </summary>
+        public static bool IsBatchViable(string menuPath)
+        {
+            if (string.IsNullOrEmpty(menuPath)) return false;
+            foreach (var allowed in BatchViableMenuAllowlist)
+            {
+                if (menuPath.StartsWith(allowed, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        public static ToolDispatchResult Execute(string body)
+        {
+            var menuPath = JsonBody.GetString(body, "menu_path");
+            if (string.IsNullOrEmpty(menuPath))
+                return ToolDispatchResult.Fail("validation_error",
+                    "Field 'menu_path' is required and must be non-empty. " +
+                    "Example: 'Assets/Refresh', 'File/Save Project'.");
+
+            // M14 T5.3 — configurable regex deny heuristic. Bypass contract is
+            // the same as execute_csharp: gate: "off" + confirm_bypass: true.
+            var bypass = BridgeDenyBypass.IsRequestedFromBody(body);
+            var deny = BridgeDenyList.EvaluateMenu(
+                menuPath, BridgeProjectSettings.MenuDenyPatterns, bypass);
+            if (!deny.Allowed)
+            {
+                return ToolDispatchResult.Fail("menu_blocked",
+                    $"{deny.Reason} Suggestion: {deny.Suggestion} " +
+                    $"Matched pattern: {deny.MatchedPattern}.");
+            }
+
+            // Hardcoded last-resort block. The regex list is configurable and
+            // can be disabled (empty array); this set is not, so a destructive
+            // menu can never reach ExecuteMenuItem even if the operator wiped
+            // the configurable list. File/Quit is the canonical entry here.
+            if (IsHardBlocked(menuPath))
+                return ToolDispatchResult.Fail("menu_blocked",
+                    $"Menu '{menuPath}' is hard-blocked for safety reasons. " +
+                    "Destructive menus cannot be executed through this tool.");
+
+            try
+            {
+                if (!EditorApplication.ExecuteMenuItem(menuPath))
+                {
+                    var exists = MenuItemExists(menuPath);
+                    if (exists == true)
+                        return ToolDispatchResult.Fail("menu_disabled",
+                            $"Menu item '{menuPath}' exists but is disabled: its validation function " +
+                            "rejected the current Editor state (for example nothing is selected, or the " +
+                            "selection has the wrong type). Change the state it validates against, then retry.");
+                    return ToolDispatchResult.Fail("menu_not_found", exists == false
+                        ? $"Menu item '{menuPath}' not found. Verify the menu path matches the Editor menu hierarchy exactly."
+                        : $"Menu item '{menuPath}' was not executed: it does not exist, or it is disabled in the current Editor state.");
+                }
+                return ToolDispatchResult.Ok("\"ok\"");
+            }
+            catch (ArgumentNullException)
+            {
+                return ToolDispatchResult.Fail("menu_not_found",
+                    $"Menu item '{menuPath}' not found. " +
+                    "Verify the menu path is correct and matches the Editor menu hierarchy exactly.");
+            }
+            catch (Exception e)
+            {
+                return ToolDispatchResult.Fail("execution_error",
+                    $"Failed to execute menu '{menuPath}': {e.Message}");
+            }
+        }
+
+        private static bool IsHardBlocked(string menuPath)
+        {
+            return BlockedMenus.Contains(menuPath);
+        }
+    }
+}

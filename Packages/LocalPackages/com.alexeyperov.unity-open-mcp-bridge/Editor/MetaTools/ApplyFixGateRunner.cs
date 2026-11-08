@@ -1,0 +1,332 @@
+using System.IO;
+using UnityOpenMcpVerify;
+using UnityOpenMcpVerify.Fixes;
+using UnityEditor;
+using UnityEngine;
+
+namespace UnityOpenMcpBridge.MetaTools
+{
+    // Orchestrates a non-dry-run apply_fix run WITH safe auto-fix rollback.
+    //
+    // The generic GatePolicy already does checkpoint → mutate → validate →
+    // delta, and delta.NewErrors > 0 means the fix made things worse. But the
+    // gate only FAILS the dispatch under enforce — it does not undo the fix.
+    // This runner adds the undo step so the gate's trust contract holds: a fix
+    // that introduces new errors (or throws) is rolled back to its pre-fix
+    // state, and the envelope reports `rolledBack` + the restored paths.
+    //
+    // Rollback scope = the issue's asset path + its companion .meta (predicted
+    // before the fix runs and snapshotted via FixRollback). That covers every
+    // current fix: remove_missing_script (.prefab/.unity), relink_broken_guid
+    // (asset YAML), remove_orphan_meta (.meta delete), fix_duplicate_guid
+    // (.meta rewrite), and the two materials fixes (.mat rewrite).
+    //
+    // High-confidence threshold for rollback = delta.NewErrors > 0 (matches the
+    // gate's own failure condition). New WARNINGS do not trigger rollback —
+    // they are informational, and several fixes legitimately change a project
+    // in ways that surface new warnings (e.g. a reassigned shader may now flag
+    // a render-queue override).
+    public static class ApplyFixGateRunner
+    {
+        // Ambient flag set while the gate runner has a FixRollback snapshot
+        // active. ApplyFixTool.Execute checks this to refuse a non-dry-run
+        // apply dispatched WITHOUT the gate runner wrapper (e.g. a batch_execute
+        // step, or gate=off direct dispatch) — those paths have no rollback
+        // protection and a fix that corrupts the asset would be permanent.
+        // Main-thread-only (bridge dispatch is serialized), so a plain static
+        // bool is safe without AsyncLocal.
+        private static bool _rollbackSnapshotActive;
+
+        internal static bool RollbackSnapshotActive => _rollbackSnapshotActive;
+
+        internal static System.Func<FixRollback> RollbackFactory = () => new FixRollback();
+
+        public static GateDispatchResult Execute(
+            string body, string gateMode, string[] pathsHint)
+        {
+            var mode = GatePolicy.ParseMode(gateMode);
+            var issueId = JsonBody.GetString(body, "issue_id");
+
+            // Predict the files the fix may touch and snapshot them BEFORE the
+            // gate runs the mutation. predictedPaths is null when the issue id
+            // can't be parsed (no snapshot ⇒ no rollback; the gate still runs).
+            var predictedPaths = PredictTouchedPaths(issueId);
+            var rollback = RollbackFactory();
+            try
+            {
+                if (predictedPaths != null && predictedPaths.Length > 0)
+                    rollback.Snapshot(predictedPaths);
+                if (rollback.HasBackupFailures)
+                    throw new IOException("One or more touched files could not be backed up.");
+            }
+            catch (System.Exception e)
+            {
+                rollback.Discard();
+                return new GateDispatchResult
+                {
+                    Mutation = ToolDispatchResult.Fail("rollback_unavailable", "Fix was not applied: " + e.Message),
+                    Outcome = GateOutcome.Skipped,
+                    SkippedReason = "rollback_unavailable",
+                    AgentNextSteps = new[] { "Check temporary-directory space and file permissions, then retry the fix." }
+                };
+            }
+
+            GateDispatchResult result;
+            var previousFlag = _rollbackSnapshotActive;
+            _rollbackSnapshotActive = true;
+            try
+            {
+                // Reuse the exact gate path (checkpoint → apply → validate →
+                // delta). ApplyFixTool.Execute runs the provider's Apply.
+                result = GatePolicy.Execute(mode, pathsHint,
+                    () => ApplyFixTool.Execute(body));
+            }
+            catch
+            {
+                // The fix threw an exception (the gate wraps the mutation in a
+                // try/catch internally, so this only fires for checkpoint
+                // failures). Roll back to be safe, then rethrow so the bridge
+                // builds the fault envelope.
+                if (rollback.HasSnapshot)
+                    rollback.Restore();
+                rollback.Discard();
+                throw;
+            }
+            finally
+            {
+                _rollbackSnapshotActive = previousFlag;
+            }
+
+            // Decide whether to roll back. Two triggers:
+            //   1. The mutation itself failed (provider returned !Success or
+            //      threw before the validate step — GatePolicy marks these
+            //      Outcome=Skipped / mutation_failed with no delta).
+            //   2. Under ENFORCE, the gate detected new errors after the fix.
+            //      (Warn mode never rolls back — the operator asked for
+            //      report-only; Off mode has no delta to check.)
+            bool mutationFailed = result.Mutation != null && !result.Mutation.Success;
+            bool gateIntroducedErrors = mode == GateMode.Enforce
+                && result.GateRan
+                && result.Delta != null
+                && result.Delta.NewErrors > 0;
+
+            if ((mutationFailed || gateIntroducedErrors) && rollback.HasSnapshot)
+            {
+                var restore = rollback.Restore();
+                AssetDatabase.Refresh();
+
+                result.RolledBack = true;
+                result.RollbackReason = mutationFailed
+                    ? "fix failed to apply — restored touched files to pre-fix state"
+                    : $"fix introduced {result.Delta.NewErrors} new error(s) under enforce — restored touched files to pre-fix state";
+                // Normalize restored paths to the Assets/-relative form the rest
+                // of the tool surface uses, so callers can compare directly
+                // against issue asset paths without handling absolute prefixes.
+                result.RestoredPaths = NormalizeRestoredPaths(restore.RestoredPaths);
+
+                // Augment agent guidance so the next step is clear.
+                var steps = result.AgentNextSteps == null
+                    ? new System.Collections.Generic.List<string>()
+                    : new System.Collections.Generic.List<string>(result.AgentNextSteps);
+                steps.Add("The fix was rolled back — no project change remains. Inspect the issue manually before retrying.");
+                // FixRollback restores file BYTES; an asset the fix mutated in
+                // memory (remove_missing_script edits live scenes AND open
+                // prefabs) still holds the pre-rollback state until it is
+                // reloaded — a later save would re-commit the rolled-back
+                // change. Warn when a restored scene or prefab is open.
+                if (RestoredOpenAsset(result.RestoredPaths, out var openAssetPath))
+                {
+                    steps.Add(
+                        $"WARNING: '{openAssetPath}' is open in the editor and still holds the pre-rollback " +
+                        "in-memory state (the rollback restored the file on disk, not the live instance). " +
+                        "Reload the scene, or close the prefab stage without saving, before saving anything — " +
+                        "otherwise the rolled-back change will be re-committed.");
+                }
+                result.AgentNextSteps = steps.ToArray();
+            }
+            else if (mode == GateMode.Off && result.Mutation != null && result.Mutation.Success)
+            {
+                // M30-polish Plan 5 / T5.1 — gate:"off" skips the delta and
+                // never consults the rollback snapshot. A fix that corrupts the
+                // asset under this path is permanent (no auto-restore). Surface
+                // a structured rollbackDisabled warning so the agent knows the
+                // mutation committed without rollback protection and can verify
+                // health manually. The operator explicitly asked for no gate,
+                // so this is a warning, not a refusal.
+                result.RollbackDisabled = true;
+                var steps = result.AgentNextSteps == null
+                    ? new System.Collections.Generic.List<string>()
+                    : new System.Collections.Generic.List<string>(result.AgentNextSteps);
+                steps.Add(
+                    "The fix was applied with gate:\"off\" — no rollback snapshot was consulted. " +
+                    "If the asset is in a bad state, run unity_open_mcp_validate_edit (or " +
+                    "unity_open_mcp_scan_paths) on the touched path to confirm health.");
+                result.AgentNextSteps = steps.ToArray();
+            }
+
+            rollback.Discard();
+            return result;
+        }
+
+        // Predict the absolute paths a fix may touch from the issue id. The
+        // issue's asset path is Assets/-relative; we resolve it against the
+        // project root and also include the companion .meta (every asset has
+        // one, and several fixes rewrite/delete the .meta). For remove_orphan_
+        // meta the issue path IS the .meta, so the .meta-only entry is the
+        // primary and the (non-existent) companion is naturally skipped by
+        // FixRollback (File.Exists == false ⇒ ExistedBefore=false ⇒ create-
+        // case rollback deletes it if the fix recreated the asset).
+        private static string[] PredictTouchedPaths(string issueId)
+        {
+            if (!IssueKey.TryParse(issueId, out _, out _, out var assetPath, out _))
+                return null;
+            if (string.IsNullOrEmpty(assetPath)) return null;
+
+            var projectRoot = Directory.GetParent(Application.dataPath)?.FullName;
+            if (string.IsNullOrEmpty(projectRoot)) return null;
+
+            var paths = new System.Collections.Generic.List<string>(2);
+            AddIfRelevant(paths, projectRoot, assetPath);
+
+            // Companion .meta. If assetPath already ends in .meta (orphan
+            // case), don't double-add; otherwise append .meta.
+            if (!assetPath.EndsWith(".meta", System.StringComparison.OrdinalIgnoreCase))
+                AddIfRelevant(paths, projectRoot, assetPath + ".meta");
+
+            return paths.Count == 0 ? null : paths.ToArray();
+        }
+
+        private static void AddIfRelevant(System.Collections.Generic.List<string> sink, string projectRoot, string assetRelativePath)
+        {
+            var abs = Path.GetFullPath(Path.Combine(projectRoot, assetRelativePath));
+            if (!sink.Contains(abs))
+                sink.Add(abs);
+        }
+
+        // True when one of the restored (Assets/-relative) paths is an asset
+        // currently open with in-memory state: a .unity scene in the editor's
+        // scene setup, or a .prefab open in a prefab stage (PrefabStageUtility
+        // reports the currently-open stage). Must run on the main thread
+        // (called from Execute, which the dispatcher runs there).
+        private static bool RestoredOpenAsset(string[] restoredPaths, out string openAssetPath)
+        {
+            openAssetPath = null;
+            if (restoredPaths == null || restoredPaths.Length == 0) return false;
+
+            UnityEditor.SceneManagement.SceneSetup[] setup = null;
+            try
+            {
+                setup = UnityEditor.SceneManagement.EditorSceneManager.GetSceneManagerSetup();
+            }
+            catch
+            {
+                // Fail-open: no warning rather than failing the rollback report.
+            }
+
+            string prefabStagePath = null;
+            try
+            {
+                var stage = UnityEditor.SceneManagement.PrefabStageUtility.GetCurrentPrefabStage();
+                prefabStagePath = stage != null ? stage.assetPath : null;
+            }
+            catch
+            {
+                // Fail-open (same reason as above).
+            }
+
+            string[] openScenePaths = null;
+            if (setup != null)
+            {
+                var paths = new System.Collections.Generic.List<string>(setup.Length);
+                foreach (var entry in setup)
+                {
+                    if (entry != null && !string.IsNullOrEmpty(entry.path))
+                        paths.Add(entry.path);
+                }
+                openScenePaths = paths.ToArray();
+            }
+
+            return FindOpenRestoredAsset(restoredPaths, openScenePaths, prefabStagePath, out openAssetPath);
+        }
+
+        // Pure matcher (no Unity API) so the path semantics are unit-testable:
+        // a restored path matches when it is a .unity scene equal to one of the
+        // open scene paths, or a .prefab equal to the open prefab-stage path.
+        // Comparison normalizes separators and is case-insensitive (Windows
+        // asset paths). Both sides are Assets/-relative.
+        internal static bool FindOpenRestoredAsset(
+            string[] restoredPaths,
+            string[] openScenePaths,
+            string openPrefabStagePath,
+            out string matchedPath)
+        {
+            matchedPath = null;
+            if (restoredPaths == null || restoredPaths.Length == 0) return false;
+
+            foreach (var restored in restoredPaths)
+            {
+                if (string.IsNullOrEmpty(restored)) continue;
+                var normalized = restored.Replace('\\', '/');
+
+                var ext = System.IO.Path.GetExtension(normalized);
+                bool isScene = string.Equals(ext, ".unity", System.StringComparison.OrdinalIgnoreCase);
+                bool isPrefab = string.Equals(ext, ".prefab", System.StringComparison.OrdinalIgnoreCase);
+                if (!isScene && !isPrefab) continue;
+
+                if (isScene && openScenePaths != null)
+                {
+                    foreach (var scenePath in openScenePaths)
+                    {
+                        if (string.IsNullOrEmpty(scenePath)) continue;
+                        if (string.Equals(scenePath.Replace('\\', '/'), normalized,
+                                System.StringComparison.OrdinalIgnoreCase))
+                        {
+                            matchedPath = normalized;
+                            return true;
+                        }
+                    }
+                }
+
+                if (isPrefab &&
+                    !string.IsNullOrEmpty(openPrefabStagePath) &&
+                    string.Equals(openPrefabStagePath.Replace('\\', '/'), normalized,
+                        System.StringComparison.OrdinalIgnoreCase))
+                {
+                    matchedPath = normalized;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Convert absolute restored paths back to the Assets/-relative form so
+        // the envelope matches the asset paths used everywhere else in the API.
+        //
+        // Three cases, checked in order:
+        //   1. norm == dataPath           → "Assets" (the Assets root itself)
+        //   2. norm starts with dataPath/  → "Assets" + suffix (a path under Assets/)
+        //   3. anything else               → unchanged (already relative, or a
+        //      sibling dir like …/AssetsBackup that must NOT be mangled into
+        //      "AssetsAssetsBackup/…").
+        // The previous implementation used a bare StartsWith(dataPath) for case
+        // 1, which also matched sibling dirs (…/AssetsBackup/…) and produced
+        // malformed paths.
+        internal static string[] NormalizeRestoredPaths(string[] restored)
+        {
+            if (restored == null || restored.Length == 0) return restored;
+            var dataPath = Application.dataPath.Replace('\\', '/');
+            var result = new string[restored.Length];
+            for (int i = 0; i < restored.Length; i++)
+            {
+                var norm = restored[i].Replace('\\', '/');
+                if (norm == dataPath)
+                    result[i] = "Assets";
+                else if (norm.StartsWith(dataPath + "/", System.StringComparison.Ordinal))
+                    result[i] = "Assets" + norm.Substring(dataPath.Length);
+                else
+                    result[i] = norm;
+            }
+            return result;
+        }
+    }
+}

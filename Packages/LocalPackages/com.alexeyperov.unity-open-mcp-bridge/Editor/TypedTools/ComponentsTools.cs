@@ -1,0 +1,1307 @@
+using System.Collections.Generic;
+using System.Globalization;
+using System.Reflection;
+using System.Text;
+using UnityEditor;
+using UnityEngine;
+using UnityOpenMcpBridge.ObjectRefs;
+
+
+namespace UnityOpenMcpBridge.TypedTools
+{
+    // M16 Plan 2 — typed component lifecycle tools. Covers add / destroy /
+    // get / modify / list_all. Mutation tools run through the gate envelope
+    // with paths_hint. `get` and `list_all` are gate-free reads.
+    //
+    // Components are addressed by type name + the GameObject they live on; an
+    // optional instance_id targets a specific component instance (for types
+    // that allow multiples, e.g. Collider or AudioSource).
+    //
+    // Serialize field/property values via SerializedObject — Unity's
+    // canonical serialization surface — so MonoBehaviour/ScriptableObject
+    // custom fields round-trip the same way they do in the Inspector.
+    public static class ComponentsTools
+    {
+        public static ToolDispatchResult Add(string body)
+        {
+            var resolved = GameObjectsTools.ResolveInstance(body);
+            if (!resolved.Ok) return resolved.Result;
+            var go = resolved.GameObject;
+
+            var typeNames = JsonBody.GetStringArray(body, "component_types");
+            if (typeNames == null || typeNames.Length == 0)
+                return ToolDispatchResult.Fail("missing_parameter",
+                    "'component_types' is required and must be a non-empty array of component type names " +
+                    "(full name or class name).");
+
+            var added = new List<string>();
+            var errors = new List<string>();
+
+            foreach (var rawType in typeNames)
+            {
+                if (string.IsNullOrWhiteSpace(rawType)) continue;
+                var type = ResolveComponentType(rawType);
+                if (type == null)
+                {
+                    errors.Add($"Type '{rawType}' not found. Use unity_open_mcp_component_list_all to discover attachable types.");
+                    continue;
+                }
+                if (!typeof(Component).IsAssignableFrom(type))
+                {
+                    errors.Add($"Type '{rawType}' ({type.FullName}) is not a Component.");
+                    continue;
+                }
+
+                Component comp;
+                try
+                {
+                    comp = Undo.AddComponent(go, type);
+                }
+                catch (System.Exception e)
+                {
+                    errors.Add($"Add '{rawType}' failed: {e.Message}");
+                    continue;
+                }
+                if (comp == null)
+                {
+                    errors.Add($"Component '{rawType}' was not added (it may disallow multiples and already exist).");
+                    continue;
+                }
+                added.Add($"{type.FullName}#{InstanceId.Of(comp)}");
+            }
+
+            if (added.Count > 0)
+            {
+                EditorUtility.SetDirty(go);
+                MarkActiveSceneDirty(go);
+            }
+
+            return ToolDispatchResult.Ok(BuildOpResult(added, errors, "added"));
+        }
+
+        public static ToolDispatchResult Destroy(string body)
+        {
+            var resolved = GameObjectsTools.ResolveInstance(body);
+            if (!resolved.Ok) return resolved.Result;
+            var go = resolved.GameObject;
+
+            var typeNames = JsonBody.GetStringArray(body, "component_types");
+            if (typeNames == null || typeNames.Length == 0)
+                return ToolDispatchResult.Fail("missing_parameter",
+                    "'component_types' is required and must be a non-empty array of component type names to remove.");
+
+            var removed = new List<string>();
+            var errors = new List<string>();
+
+            foreach (var rawType in typeNames)
+            {
+                if (string.IsNullOrWhiteSpace(rawType)) continue;
+                var type = ResolveComponentType(rawType);
+                if (type == null)
+                {
+                    errors.Add($"Type '{rawType}' not found; cannot destroy.");
+                    continue;
+                }
+                var comp = go.GetComponent(type);
+                if (comp == null)
+                {
+                    errors.Add($"No component of type '{rawType}' on GameObject '{go.name}'.");
+                    continue;
+                }
+                try
+                {
+                    Undo.DestroyObjectImmediate(comp);
+                    removed.Add(type.FullName);
+                }
+                catch (System.Exception e)
+                {
+                    errors.Add($"Destroy '{rawType}' failed: {e.Message}");
+                }
+            }
+
+            if (removed.Count > 0)
+            {
+                EditorUtility.SetDirty(go);
+                MarkActiveSceneDirty(go);
+            }
+
+            return ToolDispatchResult.Ok(BuildOpResult(removed, errors, "destroyed"));
+        }
+
+        // Component get returns the serialized field/property list of one
+        // component on a GameObject, plus its type/enable state. Read-only,
+        // gate-free. Profile + paging bound token output. Use list_all to
+        // discover component type names first.
+        public static ToolDispatchResult Get(string body)
+        {
+            var resolved = ResolveComponent(body, out var component, out var resolveError);
+            if (!resolved) return resolveError;
+
+            var options = ParseGetOptions(body);
+            var propertyPath = JsonBody.GetString(body, "property_path");
+
+            // Optional `fields` name filter (feedback-fable-31-07 §10). Parse it
+            // BEFORE collection: when present, the filter narrows the result to
+            // the requested names, so the max_fields collection cap must NOT
+            // apply (an agent asking for one field should not have to raise
+            // max_fields on a 126-field component). Raise the cap to
+            // effectively unbounded so a requested field past the default 40 is
+            // still collected before the filter runs. Paging is also turned off
+            // after collection for a filtered set.
+            var fieldsFilter = JsonBody.GetStringArray(body, "fields");
+            var hasFieldsFilter = fieldsFilter != null && fieldsFilter.Length > 0;
+
+            // Size the list from the PRE-override cap (bounded — capacity is
+            // only a hint): List<T>(capacity) allocates its backing array
+            // eagerly, so the int.MaxValue cap below must never flow into the
+            // constructor (it would throw OutOfMemoryException before a single
+            // field was collected). The override only lifts the collection
+            // COUNT cap checked in TryAddEntry.
+            var entries = new List<ComponentGetEntry>(System.Math.Min(options.MaxFields, 256));
+            if (hasFieldsFilter)
+                options.MaxFields = int.MaxValue;
+            int truncatedDuringCollect = 0;
+
+            // SerializedObject is IDisposable (holds a native SerializedFile
+            // handle). Scope it to the collection phase only — the entries are
+            // materialized into JSON strings inside this block, so the output
+            // StringBuilder below no longer touches the SerializedObject.
+            using (var so = new SerializedObject(component))
+            {
+                if (!string.IsNullOrEmpty(propertyPath))
+                {
+                    var scoped = so.FindProperty(propertyPath);
+                    if (scoped == null)
+                    {
+                        return ToolDispatchResult.Fail("property_not_found",
+                            $"Property path '{propertyPath}' not found on {component.GetType().Name}. " +
+                            "Use component_get without property_path to discover valid paths.");
+                    }
+                    CollectScopedProperty(scoped, options, entries, ref truncatedDuringCollect);
+                }
+                else
+                {
+                    CollectSerializedFields(so, options, entries, ref truncatedDuringCollect);
+                    if (options.IncludeProperties)
+                        CollectPublicProperties(component, options, entries, ref truncatedDuringCollect);
+                }
+            }
+
+            int offset = ParseGetCursor(JsonBody.GetString(body, "cursor"));
+            var pageSizeRaw = JsonBody.GetRawValue(body, "page_size");
+            int? pageSize = null;
+            if (pageSizeRaw != null)
+            {
+                pageSize = JsonBody.GetInt(body, "page_size", 25);
+                if (pageSize < 1) pageSize = 1;
+            }
+
+            // Apply the `fields` name filter parsed above (feedback-fable-31-07
+            // §10): keep only entries whose leaf path/name matches one of the
+            // requested names (case-insensitive on the last path segment; a
+            // Unity "m_" backing-field prefix on the serialized leaf is also
+            // stripped for the comparison, so "CastleNotif" matches
+            // "m_CastleNotif" and "Items[0].CastleNotif"). The cap was raised
+            // before collection so a requested field past the default
+            // max_fields is present here.
+            if (hasFieldsFilter)
+            {
+                var wanted = new System.Collections.Generic.HashSet<string>(
+                    System.Array.ConvertAll(fieldsFilter, n => n == null ? "" : n.ToLowerInvariant()));
+                var filtered = new List<ComponentGetEntry>(fieldsFilter.Length);
+                foreach (var e in entries)
+                {
+                    if (e.Path == null) continue;
+                    var leaf = e.Path;
+                    var dot = leaf.LastIndexOf('.');
+                    if (dot >= 0 && dot + 1 < leaf.Length) leaf = leaf.Substring(dot + 1);
+                    var leafLower = leaf.ToLowerInvariant();
+                    if (wanted.Contains(leafLower)
+                        || (leafLower.StartsWith("m_", System.StringComparison.Ordinal)
+                            && wanted.Contains(leafLower.Substring(2))))
+                        filtered.Add(e);
+                }
+                entries = filtered;
+                // A filtered request returns all matches; turn paging off so the
+                // agent does not chase a next_cursor for a hand-picked set.
+                pageSize = null;
+                offset = 0;
+            }
+
+            int pageStart = pageSize.HasValue ? offset : 0;
+            int pageEnd = pageSize.HasValue
+                ? System.Math.Min(offset + pageSize.Value, entries.Count)
+                : entries.Count;
+            if (pageStart > entries.Count) pageStart = entries.Count;
+            if (pageEnd < pageStart) pageEnd = pageStart;
+
+            var sb = new StringBuilder(1024);
+            sb.Append("{\"type\":\"").Append(TypedTargets.Esc(component.GetType().FullName));
+            sb.Append("\",\"name\":\"").Append(TypedTargets.Esc(component.GetType().Name));
+            sb.Append("\",\"instanceId\":").Append(InstanceId.ToJson(component));
+            sb.Append(",\"enabled\":").Append(IsEnabled(component) ? "true" : "false");
+            sb.Append(",\"profile\":\"").Append(ProfileToString(options.Profile)).Append('"');
+            if (!string.IsNullOrEmpty(propertyPath))
+                sb.Append(",\"property_path\":\"").Append(TypedTargets.Esc(propertyPath)).Append('"');
+
+            sb.Append(",\"fields\":[");
+            bool firstField = true;
+            for (int i = pageStart; i < pageEnd; i++)
+            {
+                var entry = entries[i];
+                if (entry.IsProperty)
+                    continue;
+                if (!firstField) sb.Append(',');
+                firstField = false;
+                sb.Append(entry.Json);
+            }
+            sb.Append("],\"properties\":[");
+            bool firstProp = true;
+            for (int i = pageStart; i < pageEnd; i++)
+            {
+                var entry = entries[i];
+                if (!entry.IsProperty)
+                    continue;
+                if (!firstProp) sb.Append(',');
+                firstProp = false;
+                sb.Append(entry.Json);
+            }
+            sb.Append(']');
+
+            int pageCount = pageEnd - pageStart;
+            int remainingAfterPage = entries.Count - pageEnd;
+
+            // Two distinct truncation signals, kept separate so an agent can
+            // tell which limit it hit:
+            //   - top-level `truncated`  = fields hidden by the max_fields cap
+            //     (raise `max_fields` or switch to `full` profile to see them);
+            //   - pagination.truncated   = fields after the current page window
+            //     (page on via `next_cursor`).
+            // Previously these were summed into one number, hiding the
+            // "raise max_fields" hint and conflating two different remedies.
+            sb.Append(",\"count\":").Append(pageCount);
+            sb.Append(",\"truncated\":").Append(truncatedDuringCollect);
+            if (truncatedDuringCollect > 0)
+                sb.Append(",\"truncated_by\":\"max_fields\"");
+
+            if (pageSize.HasValue)
+            {
+                BridgeJson.AppendPaginationBlock(sb, "component_get", offset, pageSize.Value, remainingAfterPage);
+            }
+
+            sb.Append('}');
+            return ToolDispatchResult.Ok(sb.ToString());
+        }
+
+        // Component modify updates serialized field(s) on a component by path
+        // via SerializedObject. `fields` is an array of {path, value, type}
+        // entries where `path` is the SerializedProperty.propertyPath (e.g.
+        // "m_Color", "m_Color.r", "mesh[0]"). Each entry is applied in order;
+        // per-entry errors are reported but do not abort the batch.
+        public static ToolDispatchResult Modify(string body)
+        {
+            var resolved = ResolveComponent(body, out var component, out var resolveError);
+            if (!resolved) return resolveError;
+
+            var entries = JsonBody.GetObjectArray(body, "fields");
+            if (entries == null || entries.Length == 0)
+                return ToolDispatchResult.Fail("missing_parameter",
+                    "'fields' is required and must be a non-empty array of { path, value, type? } patches. " +
+                    "Use component_get first to discover valid paths.");
+
+            // SerializedObject is IDisposable (holds a native SerializedFile
+            // handle) — wrap in `using` so the slot is freed even on early
+            // returns / thrown exceptions. ApplyModifiedProperties (not
+            // WithoutUndo) records the patch into the Undo system so Ctrl+Z
+            // reverts it, matching every sibling mutation surface.
+            var modified = new List<string>();
+            var errors = new List<string>();
+
+            using (var so = new SerializedObject(component))
+            {
+                // Record before applying so one Undo.PerformUndo() reverts the
+                // whole patch — consistent with gameobject_modify / material_*.
+                Undo.RecordObject(component, "MCP component_modify");
+
+                foreach (var entry in entries)
+                {
+                    var path = JsonBody.GetString(entry, "path");
+                    if (string.IsNullOrEmpty(path))
+                    {
+                        errors.Add("Skipping entry with empty 'path'.");
+                        continue;
+                    }
+                    var sp = so.FindProperty(path);
+                    if (sp == null)
+                    {
+                        errors.Add($"Property '{path}' not found on {component.GetType().Name}.");
+                        continue;
+                    }
+
+                    var valueRaw = JsonBody.GetRawValue(entry, "value");
+                    var typeHint = JsonBody.GetString(entry, "type");
+                    try
+                    {
+                        WriteSerializedProperty(sp, valueRaw, typeHint);
+                        modified.Add(path);
+                    }
+                    catch (System.Exception e)
+                    {
+                        errors.Add($"Set '{path}' failed: {e.Message}");
+                    }
+                }
+
+                if (modified.Count > 0)
+                {
+                    so.ApplyModifiedProperties();
+                    EditorUtility.SetDirty(component);
+                    MarkActiveSceneDirty(component.gameObject);
+                }
+            }
+
+            return ToolDispatchResult.Ok(BuildOpResult(modified, errors, "modified"));
+        }
+
+        // Component list_all returns a token-bounded catalog of component
+        // types that can be attached via AddComponent — built-in + project
+        // MonoBehaviours. Read-only, gate-free. Use the optional query
+        // substring to narrow by namespace/type-name (e.g. "Rigidbody",
+        // "UnityEngine", "MyNamespace.MyBehaviour").
+        public static ToolDispatchResult ListAll(string body)
+        {
+            int maxResults = JsonBody.GetInt(body, "max_results", 200);
+            if (maxResults < 1) maxResults = 1;
+            var query = JsonBody.GetString(body, "query");
+            var includeBuiltIn = JsonBody.GetBool(body, "include_builtin", true);
+            var includeProject = JsonBody.GetBool(body, "include_project", true);
+
+            var seen = new HashSet<string>();
+            var matches = new List<ComponentTypeEntry>();
+
+            // Built-in components live across MANY Unity module assemblies
+            // (PhysicsModule → Rigidbody/Colliders, AudioModule, ParticleSystem
+            // modules, …), not just CoreModule. Scanning every loaded
+            // UnityEngine.*/UnityEditor.* assembly avoids hard-coding — and
+            // drift across Unity versions — while still surfacing physics types
+            // the original 2-assembly scan silently dropped. Two passes keep
+            // built-ins surfaced before project MonoBehaviours.
+            if (includeBuiltIn)
+            {
+                foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    // `>` (not `>=`) lets the list grow to maxResults + 1 so the
+                    // truncated/limited computation below can ever be true — with
+                    // `>=` the count never exceeded maxResults and `truncated`
+                    // was unconditionally 0, falsely signalling an exhaustive list.
+                    if (matches.Count > maxResults) break;
+                    var name = asm.GetName().Name;
+                    if (!IsUnityFrameworkAssembly(name)) continue;
+                    ScanAssembly(asm, query, seen, matches, maxResults);
+                }
+            }
+
+            // Project MonoBehaviours — every NON-Unity loaded assembly that
+            // defines types deriving from Component. Includes package assemblies.
+            // `<=` (not `<`): run the project pass whenever we have not yet
+            // PROVEN overflow (matches.Count <= maxResults). With `<` a built-in
+            // pass that landed at exactly maxResults skipped the project pass and
+            // reported truncated:0 even when project components existed.
+            if (includeProject && matches.Count <= maxResults)
+            {
+                foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    if (matches.Count > maxResults) break;
+                    if (IsUnityFrameworkAssembly(asm.GetName().Name)) continue;
+                    ScanAssembly(asm, query, seen, matches, maxResults);
+                }
+            }
+
+            // The scan guards above use `>` so matches may hold up to
+            // maxResults + 1 entries — exactly enough to tell "capped" (1) from
+            // "complete" (0). This is a flat, non-paged list, so a 1/0
+            // more-results signal is the honest contract (the exact tail count
+            // is unknowable without scanning every assembly to completion).
+            int truncated = matches.Count > maxResults ? matches.Count - maxResults : 0;
+            var limited = matches.Count > maxResults ? matches.GetRange(0, maxResults) : matches;
+
+            var sb = new StringBuilder(256 + limited.Count * 96);
+            sb.Append("{\"types\":[");
+            for (int i = 0; i < limited.Count; i++)
+            {
+                if (i > 0) sb.Append(',');
+                var m = limited[i];
+                sb.Append("{\"fullName\":\"").Append(TypedTargets.Esc(m.FullName));
+                sb.Append("\",\"name\":\"").Append(TypedTargets.Esc(m.Name));
+                sb.Append("\",\"namespace\":\"").Append(TypedTargets.Esc(m.Namespace ?? ""));
+                sb.Append("\",\"assembly\":\"").Append(TypedTargets.Esc(m.Assembly));
+                sb.Append("\",\"builtin\":").Append(m.BuiltIn ? "true" : "false").Append("}");
+            }
+            sb.Append("],\"count\":").Append(limited.Count);
+            sb.Append(",\"truncated\":").Append(truncated);
+            sb.Append('}');
+            return ToolDispatchResult.Ok(sb.ToString());
+        }
+
+        // ----------------------------- helpers -----------------------------
+
+        struct ComponentTypeEntry
+        {
+            public string FullName;
+            public string Name;
+            public string Namespace;
+            public string Assembly;
+            public bool BuiltIn;
+        }
+
+        // Resolve a component type by full name (preferred) or class name
+        // fallback. Searches every loaded assembly so project MonoBehaviours
+        // resolve as well as built-in components. Skips execute_csharp snippet
+        // assemblies (UnityOpenMcpSnippet.*) — those are transient scratch
+        // assemblies whose UnityOpenMcpSnippet.Snippet type must never surface
+        // as an attachable component, and whose load-order-dependent presence
+        // caused undefined resolution when multiple snippets accumulated.
+        public static System.Type ResolveComponentType(string rawName)
+        {
+            if (string.IsNullOrWhiteSpace(rawName)) return null;
+
+            // Fast path: full-name exact match.
+            foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
+            {
+                if (MetaTools.ExecuteCSharpTool.IsSnippetAssembly(asm)) continue;
+                var type = asm.GetType(rawName);
+                if (type != null) return type;
+            }
+
+            // Class-name fallback (no namespace). Returns the first match.
+            foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
+            {
+                if (MetaTools.ExecuteCSharpTool.IsSnippetAssembly(asm)) continue;
+                foreach (var type in SafeGetTypes(asm))
+                {
+                    if (type.Name == rawName) return type;
+                }
+            }
+            return null;
+        }
+
+        private static IEnumerable<System.Type> SafeGetTypes(System.Reflection.Assembly asm)
+        {
+            // Some assemblies throw on GetTypes — not only ReflectionTypeLoadException
+            // (missing dependency in a package assembly) but also FileNotFoundException
+            // / BadImageFormatException from tooling assemblies pulled into the editor
+            // (e.g. Microsoft.CodeAnalysis.BuildTasks). Catch broadly so one broken
+            // assembly never aborts the whole component catalog; for the reflection-
+            // load case we still salvage the partial Types array.
+            try { return asm.GetTypes(); }
+            catch (ReflectionTypeLoadException e)
+            {
+                return e.Types != null ? FilterNull(e.Types) : System.Array.Empty<System.Type>();
+            }
+            catch (System.Exception)
+            {
+                return System.Array.Empty<System.Type>();
+            }
+        }
+
+        private static IEnumerable<System.Type> FilterNull(System.Type[] types)
+        {
+            foreach (var t in types) if (t != null) yield return t;
+        }
+
+        // True for the Unity framework assembly roots (UnityEngine, UnityEditor)
+        // and every module assembly under them (UnityEngine.PhysicsModule,
+        // UnityEngine.AudioModule, …). Used to split the built-in vs project
+        // scan passes in ListAll and to classify an entry as builtin.
+        private static bool IsUnityFrameworkAssembly(string name)
+            => name == "UnityEngine" || name == "UnityEditor"
+                || name.StartsWith("UnityEngine.") || name.StartsWith("UnityEditor.");
+
+        private static void ScanAssembly(System.Reflection.Assembly asm, string query,
+            HashSet<string> seen, List<ComponentTypeEntry> sink, int maxResults)
+        {
+            var asmName = asm.GetName().Name;
+            var isBuiltIn = IsUnityFrameworkAssembly(asmName);
+
+            foreach (var type in SafeGetTypes(asm))
+            {
+                // `>` mirrors the ListAll loop guards: let the sink reach
+                // maxResults + 1 so the caller's truncated check is reachable.
+                if (sink.Count > maxResults) return;
+                if (type == null) continue;
+                // Touching a broken type's metadata (e.g. a Roslyn/MSBuild type
+                // missing a transitive dependency) throws TypeLoadException at
+                // the point of resolution — during enumeration, not during
+                // GetTypes(). Isolate each type so one bad type never aborts
+                // the whole catalog scan.
+                ComponentTypeEntry? entry;
+                try
+                {
+                    if (!typeof(Component).IsAssignableFrom(type)) continue;
+                    if (type.IsAbstract) continue;
+                    if (type.IsGenericType) continue;
+                    // Skip internal Unity sub-types that can't be added directly.
+                    if (type.ContainsGenericParameters) continue;
+                    var fullName = type.FullName;
+                    if (string.IsNullOrEmpty(fullName)) continue;
+                    if (!seen.Add(fullName)) continue;
+                    if (!string.IsNullOrEmpty(query))
+                    {
+                        if (fullName.IndexOf(query, System.StringComparison.OrdinalIgnoreCase) < 0
+                            && type.Name.IndexOf(query, System.StringComparison.OrdinalIgnoreCase) < 0)
+                            continue;
+                    }
+                    entry = new ComponentTypeEntry
+                    {
+                        FullName = fullName,
+                        Name = type.Name,
+                        Namespace = type.Namespace,
+                        Assembly = asmName,
+                        BuiltIn = isBuiltIn
+                    };
+                }
+                catch (System.Exception)
+                {
+                    // Type metadata could not be resolved — skip it and move on.
+                    continue;
+                }
+                sink.Add(entry.Value);
+            }
+        }
+
+        // Resolve a single component on a GameObject: by instance_id (a
+        // specific component), or by type_name (first match).
+        private static bool ResolveComponent(string body,
+            out Component component, out ToolDispatchResult error)
+        {
+            component = null;
+            error = null;
+
+            var goResolved = GameObjectsTools.ResolveInstance(body);
+            if (!goResolved.Ok) { error = goResolved.Result; return false; }
+            var go = goResolved.GameObject;
+
+            // component_instance_id is a separate key from instance_id so a
+            // single body can resolve both the host GameObject (instance_id)
+            // and a specific component on it (component_instance_id). Read both
+            // selectors from the prefix before any patch array so a nested
+            // fields[].value.instance_id cannot shadow them
+            // (feedback-fable-31-07 §2).
+            var selectors = JsonBody.SelectorScope(body);
+            var componentInstanceId = JsonBody.GetLongFlexible(selectors, "component_instance_id", 0);
+            if (componentInstanceId != 0)
+            {
+                var found = InstanceId.ToObject(componentInstanceId) as Component;
+                if (found == null || found.gameObject != go)
+                {
+                    error = ToolDispatchResult.Fail("component_not_found",
+                        $"No component with component_instance_id={componentInstanceId} on GameObject '{go.name}'.");
+                    return false;
+                }
+                component = found;
+                return true;
+            }
+
+            var typeName = JsonBody.GetString(selectors, "type_name");
+            // component_types (array) is accepted as an alias for the singular
+            // type_name so the selector spelling matches component_add
+            // (feedback-fable-31-07 §8). Take the first element when both are
+            // absent/empty the singular is preferred.
+            if (string.IsNullOrEmpty(typeName))
+            {
+                var typesArr = JsonBody.GetStringArray(selectors, "component_types");
+                if (typesArr != null && typesArr.Length > 0) typeName = typesArr[0];
+            }
+            if (string.IsNullOrEmpty(typeName))
+            {
+                error = ToolDispatchResult.Fail("missing_parameter",
+                    "Provide 'type_name' (or 'component_instance_id') to identify the component.");
+                return false;
+            }
+
+            var type = ResolveComponentType(typeName);
+            if (type == null)
+            {
+                error = ToolDispatchResult.Fail("type_not_found",
+                    $"Component type '{typeName}' not found. Use unity_open_mcp_component_list_all to discover attachable types.");
+                return false;
+            }
+
+            component = go.GetComponent(type);
+            if (component == null)
+            {
+                error = ToolDispatchResult.Fail("component_not_found",
+                    $"GameObject '{go.name}' has no component of type '{typeName}'.");
+                return false;
+            }
+            return true;
+        }
+
+        private static bool IsEnabled(Component component)
+        {
+            if (component is Behaviour b) return b.enabled;
+            if (component is Collider c) return c.enabled;
+            return true;
+        }
+
+        private enum GetProfile
+        {
+            Compact,
+            Balanced,
+            Full
+        }
+
+        private sealed class GetOptions
+        {
+            public GetProfile Profile;
+            public int MaxFields;
+            public bool IncludeProperties;
+            public int MaxDepth;
+        }
+
+        private struct ComponentGetEntry
+        {
+            public bool IsProperty;
+            public string Json;
+            // The propertyPath (serialized field) or property Name (reflected
+            // property). Used by the optional `fields` name filter so an agent
+            // can request only the entries it cares about without paging past
+            // max_fields (feedback-fable-31-07 §10).
+            public string Path;
+        }
+
+        private static GetOptions ParseGetOptions(string body)
+        {
+            var profile = ParseGetProfile(JsonBody.GetString(body, "profile"));
+            var options = new GetOptions
+            {
+                Profile = profile,
+                MaxFields = profile == GetProfile.Compact ? 40
+                    : profile == GetProfile.Balanced ? 100 : 200,
+                IncludeProperties = profile != GetProfile.Compact,
+                MaxDepth = profile == GetProfile.Full
+                    ? System.Math.Max(1, JsonBody.GetInt(body, "max_depth", 3))
+                    : 0,
+            };
+
+            if (JsonBody.GetRawValue(body, "max_fields") != null)
+            {
+                options.MaxFields = JsonBody.GetInt(body, "max_fields", options.MaxFields);
+                if (options.MaxFields < 1) options.MaxFields = 1;
+            }
+            if (JsonBody.GetRawValue(body, "include_properties") != null)
+                options.IncludeProperties = JsonBody.GetBool(body, "include_properties", options.IncludeProperties);
+
+            return options;
+        }
+
+        private static GetProfile ParseGetProfile(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return GetProfile.Compact;
+            switch (raw.Trim().ToLowerInvariant())
+            {
+                case "balanced": return GetProfile.Balanced;
+                case "full": return GetProfile.Full;
+                default: return GetProfile.Compact;
+            }
+        }
+
+        private static string ProfileToString(GetProfile profile)
+        {
+            switch (profile)
+            {
+                case GetProfile.Balanced: return "balanced";
+                case GetProfile.Full: return "full";
+                default: return "compact";
+            }
+        }
+
+        private static int ParseGetCursor(string cursor)
+        {
+            const string prefix = "component_get:";
+            if (string.IsNullOrEmpty(cursor)) return 0;
+            if (!cursor.StartsWith(prefix, System.StringComparison.Ordinal)) return 0;
+            if (int.TryParse(cursor.Substring(prefix.Length), NumberStyles.Integer, CultureInfo.InvariantCulture, out var offset)
+                && offset >= 0)
+                return offset;
+            return 0;
+        }
+
+        private static void TryAddEntry(List<ComponentGetEntry> entries, GetOptions options,
+            ref int truncated, bool isProperty, SerializedProperty prop)
+        {
+            if (entries.Count >= options.MaxFields)
+            {
+                truncated++;
+                return;
+            }
+            entries.Add(new ComponentGetEntry
+            {
+                IsProperty = isProperty,
+                Json = BuildSerializedEntryJson(prop),
+                Path = prop.propertyPath,
+            });
+        }
+
+        private static void TryAddPropertyEntry(List<ComponentGetEntry> entries, GetOptions options,
+            ref int truncated, PropertyInfo prop, object value)
+        {
+            if (entries.Count >= options.MaxFields)
+            {
+                truncated++;
+                return;
+            }
+            entries.Add(new ComponentGetEntry
+            {
+                IsProperty = true,
+                Json = BuildPropertyEntryJson(prop, value),
+                Path = prop.Name,
+            });
+        }
+
+        private static void CollectSerializedFields(SerializedObject so, GetOptions options,
+            List<ComponentGetEntry> entries, ref int truncated)
+        {
+            var it = so.GetIterator();
+            if (!it.NextVisible(true)) return;
+            if (options.Profile == GetProfile.Full)
+            {
+                while (it.NextVisible(false))
+                    CollectSerializedProperty(it, 0, options, entries, ref truncated);
+                return;
+            }
+
+            while (it.NextVisible(false))
+                TryAddEntry(entries, options, ref truncated, false, it);
+        }
+
+        private static void CollectScopedProperty(SerializedProperty prop, GetOptions options,
+            List<ComponentGetEntry> entries, ref int truncated)
+        {
+            if (IsLeafSerializedProperty(prop) || options.Profile != GetProfile.Full)
+            {
+                TryAddEntry(entries, options, ref truncated, false, prop);
+                return;
+            }
+
+            CollectSerializedProperty(prop, 0, options, entries, ref truncated);
+        }
+
+        private static void CollectSerializedProperty(SerializedProperty prop, int depth, GetOptions options,
+            List<ComponentGetEntry> entries, ref int truncated)
+        {
+            if (IsLeafSerializedProperty(prop) || depth >= options.MaxDepth)
+            {
+                TryAddEntry(entries, options, ref truncated, false, prop);
+                return;
+            }
+
+            var copy = prop.Copy();
+            var end = prop.GetEndProperty();
+            if (!copy.NextVisible(true)) return;
+            do
+            {
+                CollectSerializedProperty(copy, depth + 1, options, entries, ref truncated);
+            }
+            while (copy.NextVisible(false) && !SerializedProperty.EqualContents(copy, end));
+        }
+
+        private static void CollectPublicProperties(Component component, GetOptions options,
+            List<ComponentGetEntry> entries, ref int truncated)
+        {
+            foreach (var prop in component.GetType().GetProperties(
+                BindingFlags.Instance | BindingFlags.Public))
+            {
+                if (entries.Count >= options.MaxFields) { truncated++; continue; }
+                if (prop.GetIndexParameters().Length > 0) continue;
+                if (prop.GetMethod == null) continue;
+                if (prop.Name == "material" || prop.Name == "materials"
+                    || prop.Name == "sharedMaterial" || prop.Name == "sharedMaterials")
+                    continue;
+                if (!IsLeafReflectionType(prop.PropertyType))
+                    continue;
+
+                object value;
+                try { value = prop.GetValue(component); }
+                catch { continue; }
+
+                TryAddPropertyEntry(entries, options, ref truncated, prop, value);
+            }
+        }
+
+        private static bool IsLeafSerializedProperty(SerializedProperty prop)
+        {
+            switch (prop.propertyType)
+            {
+                case SerializedPropertyType.Integer:
+                case SerializedPropertyType.Boolean:
+                case SerializedPropertyType.Float:
+                case SerializedPropertyType.String:
+                case SerializedPropertyType.Color:
+                case SerializedPropertyType.Vector2:
+                case SerializedPropertyType.Vector3:
+                case SerializedPropertyType.Vector4:
+                case SerializedPropertyType.Quaternion:
+                case SerializedPropertyType.Enum:
+                case SerializedPropertyType.ObjectReference:
+                case SerializedPropertyType.LayerMask:
+                case SerializedPropertyType.Rect:
+                case SerializedPropertyType.ArraySize:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static bool IsLeafReflectionType(System.Type type)
+        {
+            if (type == null) return true;
+            if (type.IsPrimitive || type.IsEnum || type == typeof(string) || type == typeof(decimal))
+                return true;
+            if (type == typeof(Vector2) || type == typeof(Vector3) || type == typeof(Vector4)
+                || type == typeof(Color) || type == typeof(Quaternion))
+                return true;
+            return typeof(Object).IsAssignableFrom(type);
+        }
+
+        private static string BuildSerializedEntryJson(SerializedProperty prop)
+        {
+            var sb = new StringBuilder(96);
+            sb.Append("{\"path\":\"").Append(TypedTargets.Esc(prop.propertyPath));
+            sb.Append("\",\"type\":\"").Append(prop.propertyType.ToString());
+            sb.Append("\",\"value\":").Append(ReadSerializedValue(prop));
+            sb.Append('}');
+            return sb.ToString();
+        }
+
+        private static string BuildPropertyEntryJson(PropertyInfo prop, object value)
+        {
+            var sb = new StringBuilder(96);
+            sb.Append("{\"path\":\"").Append(TypedTargets.Esc(prop.Name));
+            sb.Append("\",\"type\":\"").Append(TypedTargets.Esc(prop.PropertyType.Name));
+            sb.Append("\",\"value\":").Append(SerializeValue(value));
+            sb.Append('}');
+            return sb.ToString();
+        }
+
+        private static string FormatFloat(float value)
+        {
+            if (float.IsNaN(value) || float.IsInfinity(value)) return "null";
+            return value.ToString("R", CultureInfo.InvariantCulture);
+        }
+
+        private static string FormatDouble(double value)
+        {
+            if (double.IsNaN(value) || double.IsInfinity(value)) return "null";
+            return value.ToString("R", CultureInfo.InvariantCulture);
+        }
+
+        private static string ReadSerializedValue(SerializedProperty prop)
+        {
+            switch (prop.propertyType)
+            {
+                case SerializedPropertyType.Integer:
+                    return prop.intValue.ToString(CultureInfo.InvariantCulture);
+                case SerializedPropertyType.Boolean:
+                    return prop.boolValue ? "true" : "false";
+                case SerializedPropertyType.Float:
+                    return FormatFloat(prop.floatValue);
+                case SerializedPropertyType.String:
+                    return "\"" + TypedTargets.Esc(prop.stringValue) + "\"";
+                case SerializedPropertyType.Color:
+                    {
+                        var c = prop.colorValue;
+                        var sb = new StringBuilder(48);
+                        sb.Append('[').Append(FormatFloat(c.r));
+                        sb.Append(',').Append(FormatFloat(c.g));
+                        sb.Append(',').Append(FormatFloat(c.b));
+                        sb.Append(',').Append(FormatFloat(c.a)).Append(']');
+                        return sb.ToString();
+                    }
+                case SerializedPropertyType.Vector2:
+                    {
+                        var v = prop.vector2Value;
+                        var sb = new StringBuilder(32);
+                        sb.Append('[').Append(FormatFloat(v.x));
+                        sb.Append(',').Append(FormatFloat(v.y)).Append(']');
+                        return sb.ToString();
+                    }
+                case SerializedPropertyType.Vector3:
+                    {
+                        var v = prop.vector3Value;
+                        var sb = new StringBuilder(48);
+                        sb.Append('[').Append(FormatFloat(v.x));
+                        sb.Append(',').Append(FormatFloat(v.y));
+                        sb.Append(',').Append(FormatFloat(v.z)).Append(']');
+                        return sb.ToString();
+                    }
+                case SerializedPropertyType.Vector4:
+                    {
+                        var v = prop.vector4Value;
+                        var sb = new StringBuilder(64);
+                        sb.Append('[').Append(FormatFloat(v.x));
+                        sb.Append(',').Append(FormatFloat(v.y));
+                        sb.Append(',').Append(FormatFloat(v.z));
+                        sb.Append(',').Append(FormatFloat(v.w)).Append(']');
+                        return sb.ToString();
+                    }
+                case SerializedPropertyType.Quaternion:
+                    {
+                        var v = prop.quaternionValue.eulerAngles;
+                        var sb = new StringBuilder(48);
+                        sb.Append("{\"euler\":[");
+                        sb.Append(FormatFloat(v.x)).Append(',');
+                        sb.Append(FormatFloat(v.y)).Append(',');
+                        sb.Append(FormatFloat(v.z)).Append("]}");
+                        return sb.ToString();
+                    }
+                case SerializedPropertyType.Enum:
+                    return "\"" + TypedTargets.Esc(prop.enumNames[prop.enumValueIndex]) + "\"";
+                case SerializedPropertyType.ObjectReference:
+                    {
+                        var obj = prop.objectReferenceValue;
+                        if (obj == null) return "null";
+                        var sb = new StringBuilder(96);
+                        sb.Append("{\"name\":\"").Append(TypedTargets.Esc(obj.name));
+                        sb.Append("\",\"type\":\"").Append(TypedTargets.Esc(obj.GetType().FullName));
+                        sb.Append("\",\"instanceId\":").Append(InstanceId.ToJson(obj)).Append("}");
+                        return sb.ToString();
+                    }
+                case SerializedPropertyType.LayerMask:
+                    return prop.intValue.ToString(CultureInfo.InvariantCulture);
+                case SerializedPropertyType.Rect:
+                    {
+                        var r = prop.rectValue;
+                        var sb = new StringBuilder(80);
+                        sb.Append("{\"x\":").Append(FormatFloat(r.x));
+                        sb.Append(",\"y\":").Append(FormatFloat(r.y));
+                        sb.Append(",\"width\":").Append(FormatFloat(r.width));
+                        sb.Append(",\"height\":").Append(FormatFloat(r.height)).Append('}');
+                        return sb.ToString();
+                    }
+                case SerializedPropertyType.ArraySize:
+                    return prop.intValue.ToString(CultureInfo.InvariantCulture);
+                default:
+                    // Nested containers/arrays are not expanded by the
+                    // SerializedProperty leaf reader. Surface the path and the
+                    // two expansion escape hatches so an agent is not left
+                    // guessing which tool to use (feedback-fable-31-07 §10):
+                    //   - property_path on this tool drills into one subtree;
+                    //   - object_get_data expands the same array reflectively.
+                    return "{\"note\":\"container_or_array\","
+                        + "\"hint\":\"use 'property_path' to drill in, or 'object_get_data' to expand\"}";
+            }
+        }
+
+        private static void WriteSerializedProperty(SerializedProperty sp, string valueRaw, string typeHint)
+        {
+            if (valueRaw == null) valueRaw = "null";
+            valueRaw = valueRaw.Trim();
+
+            switch (sp.propertyType)
+            {
+                case SerializedPropertyType.Integer:
+                    sp.intValue = ParseInt(valueRaw);
+                    break;
+                case SerializedPropertyType.Boolean:
+                    // A4 — valueRaw arrives from JsonBody.GetRawValue, so a wire
+                    // bool lands as the quoted literal "true"/"false". Strip the
+                    // surrounding quotes first; otherwise "true" (quoted) is
+                    // treated as false. (The string branch below already strips.)
+                    sp.boolValue = StripQuotes(valueRaw) == "true";
+                    break;
+                case SerializedPropertyType.Float:
+                    sp.floatValue = ParseFloat(valueRaw);
+                    break;
+                case SerializedPropertyType.String:
+                    sp.stringValue = StripQuotes(valueRaw);
+                    break;
+                case SerializedPropertyType.Color:
+                    {
+                        var parts = MaterialTools.ParseFloatArray(valueRaw);
+                        if (parts == null || parts.Length < 3)
+                            throw new System.FormatException("color value must be [r,g,b] or [r,g,b,a].");
+                        float a = parts.Length >= 4 ? parts[3] : 1f;
+                        sp.colorValue = new Color(parts[0], parts[1], parts[2], a);
+                        break;
+                    }
+                case SerializedPropertyType.Vector2:
+                    {
+                        var parts = MaterialTools.ParseFloatArray(valueRaw);
+                        if (parts == null || parts.Length < 2)
+                            throw new System.FormatException("Vector2 value must be [x,y].");
+                        sp.vector2Value = new Vector2(parts[0], parts[1]);
+                        break;
+                    }
+                case SerializedPropertyType.Vector3:
+                    {
+                        var parts = MaterialTools.ParseFloatArray(valueRaw);
+                        if (parts == null || parts.Length < 3)
+                            throw new System.FormatException("Vector3 value must be [x,y,z].");
+                        sp.vector3Value = new Vector3(parts[0], parts[1], parts[2]);
+                        break;
+                    }
+                case SerializedPropertyType.Vector4:
+                    {
+                        var parts = MaterialTools.ParseFloatArray(valueRaw);
+                        if (parts == null || parts.Length < 4)
+                            throw new System.FormatException("Vector4 value must be [x,y,z,w].");
+                        sp.vector4Value = new Vector4(parts[0], parts[1], parts[2], parts[3]);
+                        break;
+                    }
+                case SerializedPropertyType.Quaternion:
+                    {
+                        var parts = MaterialTools.ParseFloatArray(valueRaw);
+                        if (parts != null && parts.Length >= 4)
+                        {
+                            sp.quaternionValue = new Quaternion(parts[0], parts[1], parts[2], parts[3]);
+                            break;
+                        }
+                        // Euler fallback [x,y,z] degrees.
+                        if (parts != null && parts.Length >= 3)
+                        {
+                            sp.quaternionValue = Quaternion.Euler(parts[0], parts[1], parts[2]);
+                            break;
+                        }
+                        throw new System.FormatException("Quaternion value must be [x,y,z,w] or euler [x,y,z].");
+                    }
+                case SerializedPropertyType.Enum:
+                    {
+                        if (!string.IsNullOrEmpty(typeHint) && typeHint.ToLowerInvariant() == "name")
+                        {
+                            var idx = System.Array.IndexOf(sp.enumNames, StripQuotes(valueRaw));
+                            if (idx < 0)
+                                throw new System.FormatException($"Enum value '{valueRaw}' not in [{string.Join(", ", sp.enumNames)}].");
+                            sp.enumValueIndex = idx;
+                        }
+                        else
+                        {
+                            // Numeric branch: validate the index against the
+                            // enum's name count. Unity's setter accepts any int
+                            // silently, which produces garbage on next
+                            // serialization — mirror the name branch's guard so
+                            // an out-of-range value surfaces a clear error
+                            // instead.
+                            //
+                            // Note: this index-based path does not carve out
+                            // [Flags] enums (a combined numeric like 5 maps to
+                            // no single entry in enumNames). SerializedProperty
+                            // exposes the field's enum System.Type only via
+                            // `enumType`, which was added in Unity 6 (6000.0) and
+                            // is unavailable on the 2022.3 LTS floor. The
+                            // load-bearing [Flags] fix lives in the reflection
+                            // ConvertValue path (object_modify / jsonPatches),
+                            // which CAN see the attribute via GetCustomAttribute.
+                            // component_modify callers setting a [Flags] enum by
+                            // name (type:"name") remain supported.
+                            var idx = ParseInt(valueRaw);
+                            if (idx < 0 || idx >= sp.enumNames.Length)
+                                throw new System.FormatException(
+                                    $"Enum index {idx} out of range for {sp.enumNames.Length} value(s) " +
+                                    $"[{string.Join(", ", sp.enumNames)}].");
+                            sp.enumValueIndex = idx;
+                        }
+                        break;
+                    }
+                case SerializedPropertyType.ObjectReference:
+                    {
+                        // Routed through the shared ObjectRefValue resolver
+                        // (feedback-fable-31-07 §1/§1b): scene-hierarchy paths
+                        // and {"instance_id": N} now resolve, and a resolution
+                        // failure throws a per-field error instead of silently
+                        // writing {fileID: 0}. Resolve the field's declared
+                        // UnityEngine.Object subtype via reflection so a
+                        // Component-typed field is pulled off the resolved GO.
+                        var fieldType = ResolveObjectFieldType(sp) ?? typeof(Object);
+                        var obj = ObjectRefValue.Resolve(valueRaw, fieldType, out var refError);
+                        if (refError != null)
+                            throw new System.FormatException(refError);
+                        sp.objectReferenceValue = obj;
+                        break;
+                    }
+                case SerializedPropertyType.LayerMask:
+                    sp.intValue = ParseInt(valueRaw);
+                    break;
+                case SerializedPropertyType.ArraySize:
+                    sp.intValue = ParseInt(valueRaw);
+                    break;
+                default:
+                    throw new System.NotSupportedException(
+                        $"Property '{sp.propertyPath}' has unsupported type '{sp.propertyType}'. Use a path-scoped entry for the underlying leaf.");
+            }
+        }
+
+        // Resolve the declared UnityEngine.Object subtype of an
+        // ObjectReference SerializedProperty by reflecting over the host
+        // component's fields. Used by the ObjectReference write path so a
+        // Component-typed field (e.g. a custom MonoBehaviour referencing
+        // another component, including a list element of such a field) drives
+        // GetComponent coercion on the resolved GO — without this every
+        // object-reference field looks like a generic UnityEngine.Object and a
+        // {"path": ".../GO"} value targeting a Component field would resolve to
+        // the GameObject and fail to assign.
+        //
+        // Returns null when the field cannot be located (deeply nested paths
+        // the reflection walk can't reach, or non-generic IList element types);
+        // callers fall back to typeof(UnityEngine.Object), which is the safe
+        // pre-fix behavior.
+        private static System.Type ResolveObjectFieldType(SerializedProperty sp)
+        {
+            var target = sp.serializedObject == null ? null : sp.serializedObject.targetObject;
+            if (target == null) return null;
+            return ResolveMemberType(target.GetType(), sp.propertyPath);
+        }
+
+        // Walk a propertyPath (e.g. "Foo.Bar" or "list.Array.data[3].Field")
+        // reflecting into fields, returning the declared Type of the final
+        // segment. Unity serializes a list element access as the three segments
+        // "Array", "data[N]" between the list field and the element field, so
+        // both must be consumed to reach the element type. Returns null for a
+        // type that is not a UnityEngine.Object subtype (non-object-ref fields
+        // never reach this path, but guard anyway).
+        private static System.Type ResolveMemberType(System.Type hostType, string propertyPath)
+        {
+            if (string.IsNullOrEmpty(propertyPath)) return null;
+            var current = hostType;
+            foreach (var segment in propertyPath.Split('.'))
+            {
+                if (current == null) return null;
+                var name = segment;
+                // "Array" precedes "data[N]" in Unity's serialized list path
+                // ("list.Array.data[3]"). The current type IS the list field at
+                // this point — resolve the element type from its generic arg so
+                // the following "data[N]" segment is walked against the element
+                // type, not the list type. A non-generic IList (e.g. ArrayList)
+                // cannot be resolved reflectively, so fall back.
+                if (name == "Array")
+                {
+                    // The current type IS the list field here — resolve the
+                    // element type so the following "data[N]" segment walks into
+                    // the element's fields, not the list's.
+                    current = GetListElementType(current);
+                    continue;
+                }
+                if (name.StartsWith("data["))
+                {
+                    // Element index. In Unity's canonical "list.Array.data[N]"
+                    // path the preceding "Array" segment already resolved the
+                    // element type, so this is a no-op. Only resolve again when
+                    // "Array" was absent (a malformed/hand-built path) and
+                    // current is still a list/array — otherwise re-resolving the
+                    // already-resolved element type nulls it out.
+                    if (current != null && (current.IsArray || current.IsGenericType))
+                        current = GetListElementType(current);
+                    continue;
+                }
+                var field = current.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (field == null) return null;
+                current = field.FieldType;
+            }
+            return typeof(Object).IsAssignableFrom(current) ? current : null;
+        }
+
+        // Resolve the element Type of a serialized list/array field, or null
+        // when the type is not a generic IList<T>/array (the common fallback
+        // case: reflection can't see the element type, so the caller degrades
+        // to typeof(UnityEngine.Object) which is the safe pre-fix behavior).
+        private static System.Type GetListElementType(System.Type type)
+        {
+            if (type == null) return null;
+            if (type.IsArray) return type.GetElementType();
+            if (type.IsGenericType)
+            {
+                var args = type.GetGenericArguments();
+                if (args.Length == 1) return args[0];
+            }
+            return null;
+        }
+
+        private static int ParseInt(string raw)
+        {
+            if (!int.TryParse(StripQuotes(raw), NumberStyles.Integer, CultureInfo.InvariantCulture, out var n))
+                throw new System.FormatException($"Could not parse int from '{raw}'.");
+            return n;
+        }
+
+        private static float ParseFloat(string raw)
+        {
+            if (!float.TryParse(StripQuotes(raw), NumberStyles.Float, CultureInfo.InvariantCulture, out var f))
+                throw new System.FormatException($"Could not parse float from '{raw}'.");
+            return f;
+        }
+
+        private static string StripQuotes(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return s;
+            s = s.Trim();
+            if (s.Length >= 2 && s[0] == '"' && s[s.Length - 1] == '"')
+                return s.Substring(1, s.Length - 2);
+            return s;
+        }
+
+        private static string SerializeValue(object value)
+        {
+            if (value == null) return "null";
+            switch (value)
+            {
+                case bool b: return b ? "true" : "false";
+                case int i: return i.ToString(CultureInfo.InvariantCulture);
+                case long l: return l.ToString(CultureInfo.InvariantCulture);
+                case float f: return FormatFloat(f);
+                case double d: return FormatDouble(d);
+                case string s: return "\"" + TypedTargets.Esc(s) + "\"";
+                case Vector2 v2:
+                    {
+                        var sb = new StringBuilder(32);
+                        sb.Append('[').Append(FormatFloat(v2.x));
+                        sb.Append(',').Append(FormatFloat(v2.y)).Append(']');
+                        return sb.ToString();
+                    }
+                case Vector3 v3:
+                    {
+                        var sb = new StringBuilder(48);
+                        sb.Append('[').Append(FormatFloat(v3.x));
+                        sb.Append(',').Append(FormatFloat(v3.y));
+                        sb.Append(',').Append(FormatFloat(v3.z)).Append(']');
+                        return sb.ToString();
+                    }
+                case Vector4 v4:
+                    {
+                        var sb = new StringBuilder(64);
+                        sb.Append('[').Append(FormatFloat(v4.x));
+                        sb.Append(',').Append(FormatFloat(v4.y));
+                        sb.Append(',').Append(FormatFloat(v4.z));
+                        sb.Append(',').Append(FormatFloat(v4.w)).Append(']');
+                        return sb.ToString();
+                    }
+                case Color c:
+                    {
+                        var sb = new StringBuilder(48);
+                        sb.Append('[').Append(FormatFloat(c.r));
+                        sb.Append(',').Append(FormatFloat(c.g));
+                        sb.Append(',').Append(FormatFloat(c.b));
+                        sb.Append(',').Append(FormatFloat(c.a)).Append(']');
+                        return sb.ToString();
+                    }
+                case Object uo:
+                    {
+                        var sb = new StringBuilder(96);
+                        sb.Append("{\"name\":\"").Append(TypedTargets.Esc(uo.name));
+                        sb.Append("\",\"type\":\"").Append(TypedTargets.Esc(uo.GetType().FullName));
+                        sb.Append("\",\"instanceId\":").Append(InstanceId.ToJson(uo)).Append("}");
+                        return sb.ToString();
+                    }
+                default:
+                    return "\"" + TypedTargets.Esc(value.ToString()) + "\"";
+            }
+        }
+
+        private static string BuildOpResult(List<string> done, List<string> errors, string doneLabel)
+            => AssetsTools.BuildFolderOpResult(done, errors, doneLabel);
+
+        private static void MarkActiveSceneDirty(GameObject go)
+        {
+            var scene = go.scene;
+            if (scene.IsValid()) UnityEditor.SceneManagement.EditorSceneManager.MarkSceneDirty(scene);
+        }
+    }
+}

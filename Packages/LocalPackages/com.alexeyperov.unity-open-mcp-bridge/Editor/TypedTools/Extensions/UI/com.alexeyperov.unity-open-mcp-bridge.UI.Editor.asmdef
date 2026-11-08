@@ -1,0 +1,27 @@
+{
+  "name": "com.alexeyperov.unity-open-mcp-bridge.UI.Editor",
+  "rootNamespace": "UnityOpenMcpBridge.Extensions.UIExt",
+  "references": [
+    "com.alexeyperov.unity-open-mcp-bridge.Editor",
+    "UnityEngine.UI"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [
+    "UNITY_OPEN_MCP_EXT_UI"
+  ],
+  "versionDefines": [
+    {
+      "name": "com.unity.ugui",
+      "expression": "1.0.0",
+      "define": "UNITY_OPEN_MCP_EXT_UI"
+    }
+  ],
+  "noEngineReferences": false
+}

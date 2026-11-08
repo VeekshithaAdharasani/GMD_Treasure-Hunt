@@ -1,0 +1,1182 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
+using UnityEditor;
+using UnityEngine;
+using UnityOpenMcpBridge.Config;
+using UnityOpenMcpBridge.Update;
+using UnityOpenMcpBridge.UI.Controls;
+using UnityOpenMcpVerify.Cache;
+
+namespace UnityOpenMcpBridge
+{
+    public partial class UnityOpenMcpBridgeWindow
+    {
+        // Per-repaint cache for the client-configured check. The same client's
+        // target file was being read up to three times per OnGUI (strip's
+        // all-clients loop, the auto-expand heuristic, and the configure panel).
+        // Each read does File.Exists + File.ReadAllText on the UI thread, so we
+        // memoize per-repaint instead. The cache is invalidated at the top of
+        // every DrawStatusTab by bumping _configuredCacheGeneration; it is keyed
+        // by the client Id string.
+        //
+        // The cached value is the absolute path the entry was FOUND at (null =
+        // not configured), because a project-scoped config may live in an
+        // ancestor of the Unity project and the panel names that path.
+        [NonSerialized] private int _guiGeneration;
+        [NonSerialized] private int _configuredCacheGeneration = -1;
+        [NonSerialized] private string _configuredCacheProjectPath;
+        [NonSerialized] private readonly Dictionary<string, string> _configuredCache =
+            new Dictionary<string, string>();
+        [NonSerialized] private bool _anyClientConfiguredCached;
+
+        private void DrawStatusTab()
+        {
+            // Bump the per-OnGUI generation so the configured cache (and any
+            // other per-frame memoization) invalidates exactly once per repaint.
+            _guiGeneration++;
+
+            // Refresh the per-repaint configured cache once per OnGUI so every
+            // downstream reader (strip, auto-expand, configure panel) shares one
+            // file read per client per frame.
+            RefreshConfiguredCache();
+
+            // M29 Plan 2 — connection strip leads the tab so an operator can
+            // answer "why isn't the agent talking?" in one glance, without
+            // opening foldouts. Built from existing signals only (listener,
+            // instance lock, client-config heuristic); the detailed prose +
+            // MCP-connectivity + configure-client panels stay below.
+            EditorGUILayout.Space(6);
+            ConnectionStripUI.Draw(BuildConnectionStrip());
+            EditorGUILayout.Space(8);
+            BridgeGUIUtilities.HorizontalLine(8, 6);
+
+            EditorGUILayout.LabelField("Bridge runtime", EditorStyles.boldLabel);
+
+            var running = BridgeHttpServer.IsRunning;
+            var statusColor = BridgeGUIUtilities.GetStateColor(running, BridgeSession.IsCompiling);
+            var statusText = running
+                ? (BridgeSession.IsCompiling ? "Running (compiling)" : "Running")
+                : "Stopped";
+
+            EditorGUILayout.BeginHorizontal();
+            BridgeGUIUtilities.FieldLabel("Listener", TooltipListener, 120);
+            var prev = GUI.color;
+            GUI.color = statusColor;
+            GUILayout.Label(statusText, EditorStyles.boldLabel);
+            GUI.color = prev;
+            EditorGUILayout.EndHorizontal();
+
+            EditorGUILayout.BeginHorizontal();
+            BridgeGUIUtilities.FieldLabel("Bind URL", TooltipBindUrl, 120);
+            EditorGUILayout.SelectableLabel($"http://{BindAddress}:{BridgeHttpServer.Port}/", EditorStyles.textField, GUILayout.Height(EditorGUIUtility.singleLineHeight));
+            EditorGUILayout.EndHorizontal();
+
+            EditorGUILayout.BeginHorizontal();
+            BridgeGUIUtilities.FieldLabel("Mode", "Editor session mode reported to MCP clients (live = a real Editor process).", 120);
+            EditorGUILayout.LabelField(BridgeSession.Mode);
+            EditorGUILayout.EndHorizontal();
+
+            BridgeGUIUtilities.HorizontalLine(8, 6);
+            EditorGUILayout.LabelField("Controls", EditorStyles.boldLabel);
+            EditorGUILayout.HelpBox(
+                "Start / Stop control the local HTTP listener that MCP clients connect to.\n" +
+                "• Start — launch the listener so agents can call tools. Auto-starts on Editor load unless disabled in Settings.\n" +
+                "• Stop — shut the listener down. Any connected agent loses MCP connectivity until you Start again (two-click confirm).",
+                MessageType.None);
+            DrawRuntimeControls();
+            DrawLocalPing();
+
+            if (!string.IsNullOrEmpty(_lastPingResult))
+            {
+                EditorGUILayout.Space(6);
+                EditorGUILayout.HelpBox(_lastPingResult, _lastPingMessageType);
+            }
+
+            DrawPortInUseRecoveryIfNeeded();
+
+            BridgeGUIUtilities.HorizontalLine(8, 6);
+
+            DrawMcpConnectivitySection();
+
+            BridgeGUIUtilities.HorizontalLine(8, 6);
+
+            DrawConfigureClientSection();
+
+            BridgeGUIUtilities.HorizontalLine(8, 6);
+
+            DrawUpdatesSection();
+
+            BridgeGUIUtilities.HorizontalLine(8, 6);
+
+            // Editor state + Project are diagnostic fields — collapsed by default.
+            _statusEditorStateFoldout = EditorGUILayout.Foldout(
+                _statusEditorStateFoldout, "Editor state (diagnostics)", true);
+            if (_statusEditorStateFoldout)
+            {
+                EditorGUI.indentLevel++;
+                EditorGUILayout.BeginHorizontal();
+                BridgeGUIUtilities.FieldLabel("Compiling", "Whether Unity is currently recompiling scripts. During compile, tool dispatch is paused.", 120);
+                var compileColor = BridgeSession.IsCompiling ? Color.yellow : new Color(0.6f, 0.9f, 0.6f);
+                var prevC = GUI.color;
+                GUI.color = compileColor;
+                GUILayout.Label(BridgeSession.IsCompiling ? "Yes" : "No", EditorStyles.boldLabel);
+                GUI.color = prevC;
+                EditorGUILayout.EndHorizontal();
+
+                EditorGUILayout.BeginHorizontal();
+                BridgeGUIUtilities.FieldLabel("Play mode", "Whether the Editor is in Play mode. Some tools behave differently (or are gated) while playing.", 120);
+                var playColor = BridgeSession.IsPlaying ? new Color(0.5f, 0.8f, 1f) : new Color(0.7f, 0.7f, 0.7f);
+                prevC = GUI.color;
+                GUI.color = playColor;
+                GUILayout.Label(BridgeSession.IsPlaying ? "Playing" : "Edit", EditorStyles.boldLabel);
+                GUI.color = prevC;
+                EditorGUILayout.EndHorizontal();
+                EditorGUI.indentLevel--;
+            }
+
+            _statusProjectFoldout = EditorGUILayout.Foldout(
+                _statusProjectFoldout, "Project (diagnostics)", true);
+            if (_statusProjectFoldout)
+            {
+                EditorGUI.indentLevel++;
+                EditorGUILayout.BeginHorizontal();
+                BridgeGUIUtilities.FieldLabel("Project path", "Absolute path to the Unity project root (the folder containing Assets/).", 120);
+                EditorGUILayout.SelectableLabel(BridgeSession.ProjectPath ?? "(unknown)", EditorStyles.textField);
+                EditorGUILayout.EndHorizontal();
+
+                EditorGUILayout.BeginHorizontal();
+                BridgeGUIUtilities.FieldLabel("Unity version", "Unity Editor version this bridge is running in.", 120);
+                EditorGUILayout.LabelField(BridgeSession.UnityVersion ?? "(unknown)");
+                EditorGUILayout.EndHorizontal();
+
+                EditorGUILayout.BeginHorizontal();
+                BridgeGUIUtilities.FieldLabel("Bridge version", "Version of the bridge package loaded in this Editor.", 120);
+                EditorGUILayout.LabelField(BridgeSession.BridgeVersion);
+                EditorGUILayout.EndHorizontal();
+                EditorGUI.indentLevel--;
+            }
+        }
+
+        // Populate the per-repaint client-configured cache once per OnGUI.
+        // Reads each known client's candidate files exactly once, derives the
+        // anyClientConfigured aggregate, and is consumed by the connection
+        // strip, the configure-client auto-expand heuristic, and the configure
+        // panel's per-client badge — so the same client file is never read more
+        // than once per frame. Validity is keyed on a generation counter bumped
+        // once per DrawStatusTab call (see _guiGeneration), plus the active
+        // project path so a project switch re-reads immediately.
+        private void RefreshConfiguredCache()
+        {
+            var projectPath = BridgeSession.ProjectPath;
+            if (_configuredCacheGeneration == _guiGeneration
+                && string.Equals(_configuredCacheProjectPath, projectPath, StringComparison.Ordinal))
+            {
+                return;
+            }
+            _configuredCacheGeneration = _guiGeneration;
+            _configuredCacheProjectPath = projectPath;
+            _configuredCache.Clear();
+            _anyClientConfiguredCached = false;
+            if (string.IsNullOrEmpty(projectPath)) return;
+            foreach (var client in UnityOpenMcpBridge.Config.McpClientCatalog.Clients)
+            {
+                if (!_configuredCache.TryGetValue(client.Id, out var foundAt))
+                {
+                    foundAt = FindClientConfigPath(client, projectPath);
+                    _configuredCache[client.Id] = foundAt;
+                }
+                if (!string.IsNullOrEmpty(foundAt)) _anyClientConfiguredCached = true;
+            }
+        }
+
+        // Read the path a client's config was found at from the per-repaint
+        // cache (null when not configured). Falls back to a direct read if the
+        // cache was not warmed this generation (e.g. a caller outside
+        // DrawStatusTab) so the answer is always correct.
+        private string ClientConfigPathCached(UnityOpenMcpBridge.Config.McpClientCatalog.ClientEntry client)
+        {
+            var projectPath = BridgeSession.ProjectPath;
+            if (string.IsNullOrEmpty(projectPath)) return null;
+            if (_configuredCacheGeneration == _guiGeneration
+                && string.Equals(_configuredCacheProjectPath, projectPath, StringComparison.Ordinal)
+                && _configuredCache.TryGetValue(client.Id, out var cached))
+            {
+                return cached;
+            }
+            return FindClientConfigPath(client, projectPath);
+        }
+
+        // M29 Plan 2 — gather the existing signals into the pure strip inputs
+        // and build the at-a-glance model. Kept out of DrawStatusTab so the
+        // signal collection (lock JSON read, client-config heuristic) is in
+        // one place and the builder stays pure / unit-testable.
+        private ConnectionStripModel BuildConnectionStrip()
+        {
+            var projectPath = BridgeSession.ProjectPath;
+            var hasProject = !string.IsNullOrEmpty(projectPath);
+
+            // Discovery signals — reuse the same on-disk read the MCP
+            // connectivity panel uses below; no new probes.
+            var lockAcquired = BridgeInstanceLock.IsAcquired;
+            var lockJson = BridgeInstanceLock.ReadCurrentJson();
+            var snap = BridgeInstanceLock.TryParseSnapshot(lockJson);
+
+            // Client stage — reuse the per-repaint cache populated by
+            // RefreshConfiguredCache at the top of DrawStatusTab. The check is
+            // only meaningful when a project is open; otherwise the stage reads
+            // Unknown so the operator is not told "no client" for a state where
+            // the check was never run.
+            var clientCheckAvailable = hasProject;
+            var anyConfigured = clientCheckAvailable && _anyClientConfiguredCached;
+
+            var inputs = new ConnectionStripInputs(
+                listenerRunning: BridgeHttpServer.IsRunning,
+                isCompiling: BridgeSession.IsCompiling,
+                lastStartError: BridgeHttpServer.LastStartError,
+                lockAcquired: lockAcquired,
+                lockState: snap.Valid ? snap.State : null,
+                lockSnapshotValid: snap.Valid,
+                anyClientConfigured: anyConfigured,
+                clientCheckAvailable: clientCheckAvailable);
+
+            return ConnectionStripBuilder.Build(inputs);
+        }
+
+        private void DrawRuntimeControls()
+        {
+            var running = BridgeHttpServer.IsRunning;
+            EditorGUILayout.BeginHorizontal();
+
+            EditorGUI.BeginDisabledGroup(running);
+            if (GUILayout.Button(new GUIContent("Start", "Launch the local HTTP listener so MCP clients (agents) can connect and call tools."), GUILayout.Width(110)))
+            {
+                try
+                {
+                    BridgeHttpServer.Start();
+                    if (!BridgeHttpServer.IsRunning && !string.IsNullOrEmpty(BridgeHttpServer.LastStartError))
+                    {
+                        _lastPingResult = $"Start failed: {BridgeHttpServer.LastStartError}";
+                        _lastPingMessageType = MessageType.Error;
+                    }
+                }
+                catch (Exception e)
+                {
+                    _lastPingResult = $"Start failed: {e.Message}";
+                    _lastPingMessageType = MessageType.Error;
+                }
+            }
+            EditorGUI.EndDisabledGroup();
+
+            EditorGUI.BeginDisabledGroup(!running);
+            var stopArmed = BridgeStopConfirmCoordinator.IsArmed;
+            var buttonLabel = stopArmed ? "Confirm Stop" : "Stop";
+            var buttonTooltip = stopArmed
+                ? "Click again to confirm: stops the listener and drops MCP connectivity for any active agent."
+                : "Shut the listener down. Requires a two-click confirm because it disconnects any active agent.";
+            if (GUILayout.Button(new GUIContent(buttonLabel, buttonTooltip), GUILayout.Width(110)))
+            {
+                // M29 follow-up — route through the SAME coordinator entry point
+                // the toolbar uses (RequestStop) so the two surfaces cannot
+                // drift on confirm policy. RequestStop returns false on the
+                // arming click and true once the stop actually ran.
+                var stopped = BridgeStopConfirmCoordinator.RequestStop(() =>
+                {
+                    try
+                    {
+                        BridgeHttpServer.Stop();
+                        _lastPingResult = "Bridge listener stopped. MCP clients will no longer reach the bridge until you Start again.";
+                        _lastPingMessageType = MessageType.Info;
+                    }
+                    catch (Exception e)
+                    {
+                        _lastPingResult = $"Stop failed: {e.Message}";
+                        _lastPingMessageType = MessageType.Error;
+                    }
+                });
+                if (!stopped)
+                {
+                    _lastPingResult = "Press 'Confirm Stop' within 5 seconds to stop the bridge listener.\n" +
+                                      "Warning: stopping the listener will drop MCP connectivity for any active agent.";
+                    _lastPingMessageType = MessageType.Warning;
+                    Repaint();
+                }
+            }
+            EditorGUI.EndDisabledGroup();
+
+            if (stopArmed)
+            {
+                var prev = GUI.color;
+                GUI.color = Color.yellow;
+                GUILayout.Label($"Confirm within {(float)BridgeStopConfirmCoordinator.RemainingSeconds:0.0}s");
+                GUI.color = prev;
+            }
+
+            EditorGUILayout.EndHorizontal();
+        }
+
+        private void DrawPortInUseRecoveryIfNeeded()
+        {
+            if (BridgeHttpServer.IsRunning)
+                return;
+
+            var startError = BridgeHttpServer.LastStartError;
+            if (!BridgeStartRecovery.IsPortInUseError(startError))
+                return;
+
+            EditorGUILayout.Space(4);
+            var projectPath = BridgeSession.ProjectPath ?? BridgeHttpServer.GetProjectPathForPort();
+            EditorGUILayout.HelpBox(
+                BridgeStartRecovery.FormatPortInUseRecovery(projectPath, BridgeHttpServer.Port),
+                MessageType.Info);
+        }
+
+        private void DrawLocalPing()
+        {
+            EditorGUILayout.Space(2);
+            EditorGUILayout.BeginHorizontal();
+            EditorGUI.BeginDisabledGroup(_pingInFlight || !BridgeHttpServer.IsRunning);
+            if (GUILayout.Button(new GUIContent("Ping", TooltipPing), GUILayout.Width(110)))
+            {
+                _ = RunLocalPingAsync();
+            }
+            EditorGUI.EndDisabledGroup();
+            GUILayout.Label("Local ping verifies the listener responds on the configured bind URL.", EditorStyles.miniLabel);
+            EditorGUILayout.EndHorizontal();
+        }
+
+        private async Task RunLocalPingAsync()
+        {
+            _pingInFlight = true;
+            try
+            {
+                var url = $"http://{BindAddress}:{BridgeHttpServer.Port}/ping";
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                var response = await SharedHttpClient.GetAsync(url, cts.Token).ConfigureAwait(true);
+                sw.Stop();
+                var body = await response.Content.ReadAsStringAsync().ConfigureAwait(true);
+                _lastPingResult = $"HTTP {(int)response.StatusCode} in {sw.ElapsedMilliseconds} ms\n{body}";
+                _lastPingMessageType = response.IsSuccessStatusCode ? MessageType.Info : MessageType.Warning;
+            }
+            catch (Exception e)
+            {
+                _lastPingResult = $"Ping failed: {e.Message}";
+                _lastPingMessageType = MessageType.Error;
+            }
+            finally
+            {
+                _pingInFlight = false;
+                Repaint();
+            }
+        }
+
+        // ---------- MCP connectivity panel (read-only diagnostics) ----------
+        //
+        // The bridge runs inside Unity and has no handle on the external Node MCP
+        // server process (it is spawned by the MCP client via `npx`). This panel
+        // surfaces the same signals the MCP server uses to discover this bridge
+        // (derived port + instance lock), plus an opt-in probe that shells out to
+        // `npx unity-open-mcp status` so the operator can self-diagnose end-to-end
+        // connectivity without leaving Unity. It is strictly read-only — there is
+        // no start/stop of the MCP server here (that's the MCP client's job).
+
+        private void DrawMcpConnectivitySection()
+        {
+            _mcpConnectivityFoldout = EditorGUILayout.Foldout(
+                _mcpConnectivityFoldout, "MCP connectivity", true);
+            if (!_mcpConnectivityFoldout) return;
+
+            EditorGUI.indentLevel++;
+            EditorGUILayout.HelpBox(
+                "The bridge runs inside Unity; the MCP server is a separate Node process the MCP client " +
+                "(Cursor/Claude) spawns via `npx`. This panel shows the discovery signals the MCP server " +
+                "uses to reach this bridge, and lets you probe end-to-end connectivity.",
+                MessageType.None);
+
+            var projectPath = BridgeSession.ProjectPath;
+
+            // Derived port — what the MCP server computes for this project.
+            var hasProject = !string.IsNullOrEmpty(projectPath);
+            var derivedPort = hasProject ? InstancePortResolver.ComputePort(projectPath) : 0;
+            EditorGUILayout.BeginHorizontal();
+            BridgeGUIUtilities.FieldLabel(
+                "Derived port",
+                "Port the MCP server derives for this project (20000 + sha256(path) % 10000). " +
+                "UNITY_OPEN_MCP_BRIDGE_PORT env / -UNITY_OPEN_MCP_BRIDGE_PORT CLI override this on the server side.",
+                120);
+            EditorGUILayout.SelectableLabel(
+                hasProject ? derivedPort.ToString() : "(unknown project path)",
+                EditorStyles.textField,
+                GUILayout.Height(EditorGUIUtility.singleLineHeight));
+            EditorGUILayout.EndHorizontal();
+
+            // Instance lock — the discovery/heartbeat file the MCP server reads.
+            EditorGUILayout.BeginHorizontal();
+            BridgeGUIUtilities.FieldLabel(
+                "Instance lock",
+                "Lock + heartbeat file at ~/.unity-open-mcp/instances/<hash>.json. The MCP server reads it " +
+                "to find this bridge's port + auth token without an HTTP round-trip.",
+                120);
+            EditorGUILayout.SelectableLabel(
+                hasProject ? InstancePortResolver.LockPath(projectPath) : "(unknown project path)",
+                EditorStyles.textField,
+                GUILayout.Height(EditorGUIUtility.singleLineHeight));
+            EditorGUILayout.EndHorizontal();
+
+            // Live lock state parsed from the on-disk file.
+            var lockAcquired = BridgeInstanceLock.IsAcquired;
+            var lockJson = BridgeInstanceLock.ReadCurrentJson();
+            var snap = BridgeInstanceLock.TryParseSnapshot(lockJson);
+            EditorGUILayout.BeginHorizontal();
+            BridgeGUIUtilities.FieldLabel(
+                "Lock state",
+                "Whether this bridge has acquired the instance lock and the last heartbeat written.",
+                120);
+            var prevColor = GUI.color;
+            GUI.color = lockAcquired ? new Color(0.6f, 0.9f, 0.6f) : new Color(1f, 0.5f, 0.5f);
+            GUILayout.Label(lockAcquired ? "acquired" : "not acquired", EditorStyles.boldLabel);
+            GUI.color = prevColor;
+            EditorGUILayout.EndHorizontal();
+
+            if (snap.Valid)
+            {
+                if (!string.IsNullOrEmpty(snap.State))
+                {
+                    EditorGUILayout.BeginHorizontal();
+                    BridgeGUIUtilities.FieldLabel("Heartbeat state", "Last editor state written to the lock.", 120);
+                    EditorGUILayout.LabelField(snap.State);
+                    EditorGUILayout.EndHorizontal();
+                }
+                if (!string.IsNullOrEmpty(snap.HeartbeatAt))
+                {
+                    EditorGUILayout.BeginHorizontal();
+                    BridgeGUIUtilities.FieldLabel("Heartbeat at", "Timestamp of the last heartbeat write (UTC).", 120);
+                    EditorGUILayout.LabelField(snap.HeartbeatAt);
+                    EditorGUILayout.EndHorizontal();
+                }
+            }
+
+            // Expected launch command for the MCP client — what the operator
+            // (or their MCP client config) should run to connect.
+            EditorGUILayout.BeginHorizontal();
+            BridgeGUIUtilities.FieldLabel(
+                "Client launch",
+                "The command the MCP client runs to start the MCP server for this project. " +
+                "The MCP server auto-discovers the bridge port via the instance lock.",
+                120);
+            EditorGUILayout.SelectableLabel(
+                hasProject ? $"{BridgeConstants.ProjectPathEnvVar}=\"{projectPath}\" npx -y {BridgeConstants.NpmPackage}" : "(unknown project path)",
+                EditorStyles.textField,
+                GUILayout.Height(EditorGUIUtility.singleLineHeight));
+            EditorGUILayout.EndHorizontal();
+
+            // Opt-in probe. Shells out to the MCP server's own status command.
+            EditorGUILayout.Space(4);
+            EditorGUILayout.BeginHorizontal();
+            EditorGUI.BeginDisabledGroup(_mcpProbeInFlight || !hasProject);
+            if (GUILayout.Button(
+                new GUIContent(_mcpProbeInFlight ? "Probing…" : "Probe MCP server",
+                    $"Runs `npx -y {BridgeConstants.NpmPackage} status` to check end-to-end discovery + bridge reachability. " +
+                    "Requires Node/npx on PATH. Does not start a long-running server."),
+                GUILayout.Width(160)))
+            {
+                _ = RunMcpProbeAsync(projectPath);
+            }
+            EditorGUI.EndDisabledGroup();
+            EditorGUILayout.EndHorizontal();
+
+            if (!string.IsNullOrEmpty(_mcpProbeResult))
+            {
+                EditorGUILayout.Space(4);
+                EditorGUILayout.HelpBox(_mcpProbeResult, _mcpProbeMessageType);
+            }
+
+            EditorGUI.indentLevel--;
+        }
+
+        // ---------- Project updates ----------
+
+        private void DrawUpdatesSection()
+        {
+            _upgradeFoldout = EditorGUILayout.Foldout(_upgradeFoldout, "Updates", true);
+            if (!_upgradeFoldout) return;
+
+            EditorGUI.indentLevel++;
+            EditorGUILayout.HelpBox(
+                "Check a published trio version, preview every pin owned by this project, then apply it. " +
+                "No network request or file write happens until you click the corresponding button.",
+                MessageType.None);
+
+            EditorGUILayout.LabelField("Running bridge", BridgeSession.BridgeVersion ?? "(unknown)");
+            EditorGUILayout.LabelField("Latest published",
+                string.IsNullOrEmpty(LatestVersionCheck.CachedVersion)
+                    ? "(not checked)" : LatestVersionCheck.CachedVersion);
+
+            EditorGUI.BeginDisabledGroup(_upgradeChecking || _upgradeApplying);
+            if (GUILayout.Button(_upgradeChecking ? "Checking…" : "Check latest", GUILayout.Width(130)))
+                _ = RunLatestVersionCheckAsync();
+            EditorGUI.EndDisabledGroup();
+
+            EditorGUI.BeginChangeCheck();
+            _upgradeTargetVersion = EditorGUILayout.TextField("Target version", _upgradeTargetVersion ?? "");
+            _upgradeUpm = EditorGUILayout.ToggleLeft("Unity packages (bridge + verify)", _upgradeUpm);
+            _upgradeProjectConfigs = EditorGUILayout.ToggleLeft("Project client configs", _upgradeProjectConfigs);
+            _upgradeHomeConfigs = EditorGUILayout.ToggleLeft("Home client configs", _upgradeHomeConfigs);
+            _upgradeProse = EditorGUILayout.ToggleLeft("Agent-facing prose and examples", _upgradeProse);
+            if (EditorGUI.EndChangeCheck())
+            {
+                _upgradePlan = null;
+                EditorPrefs.SetBool(UpgradeUpmPref, _upgradeUpm);
+                EditorPrefs.SetBool(UpgradeProjectConfigsPref, _upgradeProjectConfigs);
+                EditorPrefs.SetBool(UpgradeHomeConfigsPref, _upgradeHomeConfigs);
+                EditorPrefs.SetBool(UpgradeProsePref, _upgradeProse);
+            }
+
+            EditorGUILayout.BeginHorizontal();
+            var validTarget = VersionPinRewriter.IsVersion(
+                VersionPinRewriter.NormalizeVersion(_upgradeTargetVersion));
+            EditorGUI.BeginDisabledGroup(_upgradeChecking || _upgradeApplying || !validTarget
+                || string.IsNullOrEmpty(BridgeSession.ProjectPath));
+            if (GUILayout.Button("Preview", GUILayout.Width(110))) PreviewUpgrade();
+            EditorGUI.EndDisabledGroup();
+
+            EditorGUI.BeginDisabledGroup(_upgradeChecking || _upgradeApplying || _upgradePlan == null);
+            if (GUILayout.Button(_upgradeApplying ? "Applying…" : "Apply…", GUILayout.Width(110)))
+                _ = ConfirmAndApplyUpgradeAsync();
+            EditorGUI.EndDisabledGroup();
+            EditorGUILayout.EndHorizontal();
+
+            if (!validTarget && !string.IsNullOrEmpty(_upgradeTargetVersion))
+                EditorGUILayout.HelpBox("Target version must be a plain X.Y.Z.", MessageType.Warning);
+
+            if (_upgradePlan != null)
+            {
+                EditorGUILayout.LabelField("Preview", EditorStyles.miniBoldLabel);
+                EditorGUILayout.SelectableLabel(
+                    ProjectUpgradeRunner.FormatReport(_upgradePlan), EditorStyles.textArea,
+                    GUILayout.MinHeight(100));
+            }
+
+            var persisted = ProjectUpgradeRunner.LastReport;
+            if (!string.IsNullOrEmpty(persisted))
+                EditorGUILayout.HelpBox(persisted, MessageType.Info);
+            if (!string.IsNullOrEmpty(_upgradeMessage))
+                EditorGUILayout.HelpBox(_upgradeMessage, _upgradeMessageType);
+
+            EditorGUI.indentLevel--;
+        }
+
+        private async Task RunLatestVersionCheckAsync()
+        {
+            _upgradeChecking = true;
+            _upgradeMessage = "";
+            Repaint();
+            var result = await LatestVersionCheck.CheckAsync();
+            _upgradeChecking = false;
+            LatestVersionCheck.Remember(result);
+            if (result.Success)
+            {
+                _upgradeTargetVersion = result.Version;
+                _upgradePlan = null;
+                _upgradeMessage = "Latest published trio version: " + result.Version;
+                _upgradeMessageType = MessageType.Info;
+            }
+            else
+            {
+                _upgradeMessage = result.Error;
+                _upgradeMessageType = MessageType.Warning;
+            }
+            Repaint();
+        }
+
+        private void PreviewUpgrade()
+        {
+            var options = new ProjectUpgradeRunner.Options(
+                _upgradeUpm, _upgradeProjectConfigs, _upgradeHomeConfigs, _upgradeProse);
+            _upgradePlan = ProjectUpgradeRunner.Plan(
+                BridgeSession.ProjectPath,
+                VersionPinRewriter.NormalizeVersion(_upgradeTargetVersion),
+                options);
+            _upgradeMessage = string.IsNullOrEmpty(_upgradePlan.Error)
+                ? "Preview ready. Review every update and skip reason before applying."
+                : _upgradePlan.Error;
+            _upgradeMessageType = string.IsNullOrEmpty(_upgradePlan.Error)
+                ? MessageType.Info : MessageType.Error;
+        }
+
+        private async Task ConfirmAndApplyUpgradeAsync()
+        {
+            if (_upgradePlan == null) return;
+            var report = ProjectUpgradeRunner.FormatReport(_upgradePlan);
+            if (!EditorUtility.DisplayDialog(
+                    "Apply project update",
+                    report + "\n\nBackups are written as <file>.bak before the first write. Continue?",
+                    "Apply", "Cancel"))
+                return;
+
+            _upgradeApplying = true;
+            _upgradeMessage = "";
+            Repaint();
+            if (_upgradePlan.UpmEnabled)
+            {
+                var tag = await LatestVersionCheck.ConfirmBridgeTagAsync(_upgradePlan.TargetVersion);
+                if (!tag.Success)
+                {
+                    _upgradeApplying = false;
+                    _upgradeMessage = tag.Error;
+                    _upgradeMessageType = MessageType.Error;
+                    Repaint();
+                    return;
+                }
+            }
+            var result = ProjectUpgradeRunner.Apply(_upgradePlan);
+            _upgradeApplying = false;
+            _upgradeMessage = result.Message;
+            _upgradeMessageType = result.Success ? MessageType.Info : MessageType.Error;
+            _upgradePlan = null;
+            Repaint();
+        }
+
+        // ---------- Configure AI client (M27 Plan 5) ----------
+        //
+        // Generates the MCP client config snippet for the selected client
+        // against the current project, so an operator can copy it without
+        // leaving Unity. The Hub wizard (Rust) remains the canonical one-click
+        // writer; this panel mirrors the envelope shapes so the bytes match.
+        // See McpClientCatalog for the catalog + envelope builders.
+
+        private void DrawConfigureClientSection()
+        {
+            // Declared once at the top of the method: both the auto-expand
+            // heuristic below and the snippet rendering further down need the
+            // project path. A nested `var projectPath` in the if-block collides
+            // with this one (CS0136), so it is reused everywhere in the method.
+            var projectPath = BridgeSession.ProjectPath;
+
+            // M29 Plan 4 — auto-expand the section when NO known client is
+            // configured for this project (the operator most likely to miss it
+            // is the one who still needs to wire a client). This keys on the
+            // SAME anyConfigured signal the connection strip shows, so the
+            // foldout and the strip never disagree (the strip says "Client:
+            // configured" iff this stays collapsed). The operator's explicit
+            // foldout toggle always wins: once they open or close the section
+            // by hand, that choice is remembered in EditorPrefs and the
+            // auto-expand heuristic no longer runs.
+            if (!_configureClientFoldoutUserChose && !string.IsNullOrEmpty(projectPath))
+            {
+                _configureClientFoldout = !_anyClientConfiguredCached;
+            }
+
+            var prevFoldout = _configureClientFoldout;
+            _configureClientFoldout = EditorGUILayout.Foldout(
+                _configureClientFoldout, "Configure AI client", true);
+            // The operator toggled the foldout by hand — record that a manual
+            // choice now exists so it wins over auto-expand on future repaints.
+            if (_configureClientFoldout != prevFoldout)
+            {
+                _configureClientFoldoutUserChose = true;
+                EditorPrefs.SetBool(ConfigureClientFoldoutPref, _configureClientFoldout);
+            }
+            if (!_configureClientFoldout) return;
+
+            EditorGUI.indentLevel++;
+            EditorGUILayout.HelpBox(
+                "Copy the MCP client config snippet for this project into your AI " +
+                "client's config file. The Hub wizard (Unity Hub Pro) writes the file " +
+                "for you in one click; this panel is for configuring a client without " +
+                "leaving Unity. The launch command is `npx -y " + BridgeConstants.NpmPackage + "` " +
+                "(or `node <root>/mcp-server/dist/index.js` for a local checkout).",
+                MessageType.None);
+
+            var hasProject = !string.IsNullOrEmpty(projectPath);
+            if (!hasProject)
+            {
+                EditorGUILayout.HelpBox("Open a Unity project to configure a client.", MessageType.Warning);
+                EditorGUI.indentLevel--;
+                return;
+            }
+
+            // Clamp the index so a catalog change never produces an out-of-range.
+            var catalog = UnityOpenMcpBridge.Config.McpClientCatalog.Clients;
+            if (_configureClientIndex < 0 || _configureClientIndex >= catalog.Length)
+            {
+                _configureClientIndex = 0;
+            }
+            var displayNames = new string[catalog.Length];
+            for (var i = 0; i < catalog.Length; i++) displayNames[i] = catalog[i].DisplayName;
+            _configureClientIndex = EditorGUILayout.Popup("Client", _configureClientIndex, displayNames);
+            var client = catalog[_configureClientIndex];
+
+            // Resolve the launch command + port for the snippet.
+            var port = InstancePortResolver.ComputePort(projectPath);
+            // The in-Unity panel defaults to the npm launch (no toolkit root
+            // required); a local checkout should be configured via the Hub
+            // wizard where the toolkit root is validated.
+            var command = "npx";
+            var args = new[] { "-y", BridgeConstants.NpmPackage };
+
+            // Commit-safe form: no machine path, no bridge port. Offered for
+            // every client that has one; on by default inside a repository.
+            var workspaceRoot = ConfigureClientWorkspaceRoot(projectPath);
+            var placement = DrawConfigureClientPortableToggle(client, projectPath, workspaceRoot);
+
+            // Regenerate the snippet + target path on every repaint so it
+            // always reflects the current client + project.
+            _configureClientSnippet =
+                UnityOpenMcpBridge.Config.McpClientCatalog.BuildSnippet(client, projectPath, port, command, args, placement);
+            _configureClientTargetPath = placement.HasValue
+                ? UnityOpenMcpBridge.Config.McpClientCatalog.ResolvePortableTargetPath(client, placement.Value) ?? ""
+                : UnityOpenMcpBridge.Config.McpClientCatalog.ResolveDisplayPath(client, projectPath) ?? "";
+
+            // Configured-state check: read the candidate files (when
+            // file-backed) and look for our server key under the client's merge
+            // key. Uses the per-repaint cache populated by
+            // RefreshConfiguredCache so each file is read at most once per
+            // client per frame. The candidates include ancestors of the Unity
+            // project, so a project inside a larger repository resolves against
+            // that repository's config.
+            _configureClientFoundPath = ClientConfigPathCached(client) ?? "";
+            _configureClientConfigured = !string.IsNullOrEmpty(_configureClientFoundPath);
+
+            if (client.IsFileBacked && !string.IsNullOrEmpty(_configureClientTargetPath))
+            {
+                EditorGUILayout.BeginHorizontal();
+                BridgeGUIUtilities.FieldLabel(
+                    "Target",
+                    "Config file this snippet should be merged into. The Hub wizard writes " +
+                    "this file for you; from here, copy the snippet and paste it under the " +
+                    "merge key shown in the snippet.",
+                    120);
+                EditorGUILayout.SelectableLabel(
+                    _configureClientTargetPath,
+                    EditorStyles.textField,
+                    GUILayout.Height(EditorGUIUtility.singleLineHeight));
+                EditorGUILayout.EndHorizontal();
+
+                EditorGUILayout.BeginHorizontal();
+                BridgeGUIUtilities.FieldLabel("Configured", "Whether a unity-open-mcp entry was found for this project — in the target file, or in one of its parent folders.", 120);
+                var prev = GUI.color;
+                GUI.color = _configureClientConfigured ? new Color(0.6f, 0.9f, 0.6f) : new Color(1f, 0.85f, 0.5f);
+                GUILayout.Label(_configureClientConfigured ? "yes" : "no", EditorStyles.boldLabel);
+                GUI.color = prev;
+                EditorGUILayout.EndHorizontal();
+
+                // Found somewhere other than the project folder — name the file
+                // so the operator does not go looking for a second config (and
+                // knows which one to edit when switching versions).
+                var foundElsewhere = _configureClientConfigured
+                    && !string.Equals(
+                        _configureClientFoundPath,
+                        _configureClientTargetPath,
+                        StringComparison.Ordinal);
+                if (foundElsewhere)
+                {
+                    EditorGUILayout.BeginHorizontal();
+                    BridgeGUIUtilities.FieldLabel(
+                        "Found in",
+                        "The config that actually configures this project. Clients read " +
+                        "project-scoped config relative to the folder they were opened on, " +
+                        "so a Unity project inside a larger repository is configured by the " +
+                        "repository's file rather than one next to Assets/.",
+                        120);
+                    EditorGUILayout.SelectableLabel(
+                        _configureClientFoundPath,
+                        EditorStyles.textField,
+                        GUILayout.Height(EditorGUIUtility.singleLineHeight));
+                    EditorGUILayout.EndHorizontal();
+                }
+            }
+            else if (client.IsCliOnly && placement.HasValue)
+            {
+                EditorGUILayout.HelpBox(
+                    "Run the `claude mcp add` command below from " + placement.Value.WorkspaceRoot +
+                    ". `--scope project` writes the entry to .mcp.json there — commit that file.",
+                    MessageType.Info);
+            }
+            else if (client.IsCliOnly)
+            {
+                EditorGUILayout.HelpBox(
+                    "Claude Code is CLI-only — copy the `claude mcp add` command below and run it " +
+                    "in a terminal (no config file is written).",
+                    MessageType.Info);
+            }
+            else
+            {
+                EditorGUILayout.HelpBox(
+                    "Manual / custom — copy the snippet below and paste it into your client's " +
+                    "config under the appropriate merge key.",
+                    MessageType.Info);
+            }
+
+            if (placement.HasValue
+                && placement.Value.Strategy == UnityOpenMcpBridge.Config.McpClientCatalog.PortableStrategy.Wrapper)
+            {
+                DrawConfigureClientWrapperRow(placement.Value);
+            }
+
+            EditorGUILayout.LabelField("Snippet", EditorStyles.miniBoldLabel);
+            EditorGUILayout.SelectableLabel(
+                _configureClientSnippet,
+                EditorStyles.textArea,
+                GUILayout.ExpandHeight(true),
+                GUILayout.MinHeight(110));
+
+            EditorGUILayout.Space(4);
+            EditorGUILayout.BeginHorizontal();
+            if (GUILayout.Button(new GUIContent(
+                "Copy snippet",
+                "Copy the config snippet above to the clipboard."),
+                GUILayout.Width(120)))
+            {
+                GUIUtility.systemCopyBuffer = _configureClientSnippet;
+            }
+            // M29 Plan 4 — Copy path + Open target close the discoverability
+            // gap for file-backed clients without duplicating the Hub wizard's
+            // merge writer. The buttons are only meaningful when a target file
+            // path resolves (file-backed clients with a path template); CLI /
+            // manual clients have no file to reveal.
+            //
+            // When the entry was found in a parent folder, both buttons act on
+            // THAT file: revealing the project-scoped path instead would create
+            // a second, redundant config next to Assets/ and leave the operator
+            // editing the one their client does not read.
+            var canTargetFile = client.IsFileBacked && !string.IsNullOrEmpty(_configureClientTargetPath);
+            var actionPath = string.IsNullOrEmpty(_configureClientFoundPath)
+                ? _configureClientTargetPath
+                : _configureClientFoundPath;
+            EditorGUI.BeginDisabledGroup(!canTargetFile);
+            if (GUILayout.Button(new GUIContent(
+                "Copy path",
+                "Copy the config file path to the clipboard — the existing config when one " +
+                "was found, otherwise the target this snippet should be written to."),
+                GUILayout.Width(100)))
+            {
+                GUIUtility.systemCopyBuffer = actionPath;
+            }
+            if (GUILayout.Button(new GUIContent(
+                "Open target",
+                "Reveal the config file in the OS file browser (Finder / Explorer) — the " +
+                "existing config when one was found, otherwise the target for this snippet. " +
+                "Creates the file first (as a valid empty document) if it does not yet exist, " +
+                "so you can paste the snippet into it without hunting for the path."),
+                GUILayout.Width(110)))
+            {
+                RevealClientConfigTarget(actionPath, client.EnvelopeKind);
+            }
+            EditorGUI.EndDisabledGroup();
+            EditorGUILayout.EndHorizontal();
+
+            EditorGUILayout.BeginHorizontal();
+            if (GUILayout.Button("Open in Unity Hub Pro", GUILayout.Width(180)))
+            {
+                Application.OpenURL(RepoUrl);
+            }
+            EditorGUILayout.EndHorizontal();
+            EditorGUILayout.HelpBox(
+                "Unity Hub Pro writes this config in one click with merge-safe backups, " +
+                "scope toggles, and a full 6-step onboarding wizard.",
+                MessageType.None);
+
+            EditorGUI.indentLevel--;
+        }
+
+        private string ConfigureClientWorkspaceRoot(string projectPath)
+        {
+            if (!string.Equals(_configureClientWorkspaceFor, projectPath, StringComparison.Ordinal))
+            {
+                _configureClientWorkspaceFor = projectPath;
+                _configureClientWorkspaceRoot =
+                    UnityOpenMcpBridge.Config.McpClientCatalog.FindWorkspaceRoot(projectPath);
+            }
+            return _configureClientWorkspaceRoot;
+        }
+
+        /// <summary>
+        /// Draw the commit-safe toggle and return the portable placement to
+        /// build the snippet with, or <c>null</c> for the absolute form. A client
+        /// without a portable form (a global config) gets a note instead of a
+        /// toggle, so the operator knows why the snippet names this machine.
+        /// </summary>
+        private UnityOpenMcpBridge.Config.McpClientCatalog.PortablePlacement? DrawConfigureClientPortableToggle(
+            UnityOpenMcpBridge.Config.McpClientCatalog.ClientEntry client,
+            string projectPath,
+            string workspaceRoot)
+        {
+            var candidate = UnityOpenMcpBridge.Config.McpClientCatalog.ResolvePortablePlacement(
+                client, projectPath, workspaceRoot);
+            if (!candidate.HasValue)
+            {
+                EditorGUILayout.HelpBox(
+                    client.DisplayName + " reads a machine-wide config, so its entry carries this " +
+                    "machine's absolute project path and bridge port. Pick a project-scoped client " +
+                    "for a config you can commit.",
+                    MessageType.None);
+                return null;
+            }
+
+            var enabled = EditorPrefs.HasKey(ConfigureClientPortablePref)
+                ? EditorPrefs.GetBool(ConfigureClientPortablePref)
+                : !string.IsNullOrEmpty(workspaceRoot);
+            var tooltip =
+                "Name the Unity project without this machine's path, so the config can be committed " +
+                "and works for every teammate after checkout. The entry goes to the repository root (" +
+                candidate.Value.WorkspaceRoot + ")" +
+                (candidate.Value.UnitySubpath.Length > 0
+                    ? " and points at " + candidate.Value.UnitySubpath + "/ inside it."
+                    : ".") +
+                " The bridge port is discovered at startup instead of pinned.";
+            var next = EditorGUILayout.ToggleLeft(new GUIContent("Commit-safe config", tooltip), enabled);
+            if (next != enabled) EditorPrefs.SetBool(ConfigureClientPortablePref, next);
+            return next ? candidate : null;
+        }
+
+        /// <summary>
+        /// Wrapper-backed clients (Codex, ZCode) run a committed script that
+        /// resolves the project from its own location. Show where it goes and
+        /// offer to write it, since the snippet is useless without it.
+        /// </summary>
+        private static void DrawConfigureClientWrapperRow(
+            UnityOpenMcpBridge.Config.McpClientCatalog.PortablePlacement placement)
+        {
+            var wrapperPath = placement.WrapperAbsolutePath;
+            var exists = File.Exists(wrapperPath);
+            EditorGUILayout.HelpBox(
+                "This client cannot name the project in its config, so it runs a committed wrapper " +
+                "script that resolves the Unity folder from its own location. Commit the script " +
+                "together with the config." + (exists ? "" : " The script does not exist yet."),
+                exists ? MessageType.None : MessageType.Warning);
+            EditorGUILayout.BeginHorizontal();
+            BridgeGUIUtilities.FieldLabel(
+                "Wrapper",
+                "Launch script the snippet runs, relative to the repository root.",
+                120);
+            EditorGUILayout.SelectableLabel(
+                wrapperPath,
+                EditorStyles.textField,
+                GUILayout.Height(EditorGUIUtility.singleLineHeight));
+            if (GUILayout.Button(new GUIContent(
+                    exists ? "Rewrite" : "Write",
+                    "Write the wrapper script for " + BridgeConstants.NpmPackage + ". Overwrites an " +
+                    "existing script at this path."),
+                GUILayout.Width(70)))
+            {
+                WriteWrapperScript(wrapperPath, placement);
+            }
+            EditorGUILayout.EndHorizontal();
+        }
+
+        private static void WriteWrapperScript(
+            string wrapperPath, UnityOpenMcpBridge.Config.McpClientCatalog.PortablePlacement placement)
+        {
+            try
+            {
+                var dir = Path.GetDirectoryName(wrapperPath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                var body = UnityOpenMcpBridge.Config.McpWrapperScript.Render(
+                    UnityOpenMcpBridge.Config.McpWrapperScript.PinnedVersion(),
+                    placement.WrapperRelativePath,
+                    placement.UnitySubpath);
+                File.WriteAllText(wrapperPath, body);
+                Debug.Log($"[UnityOpenMcpBridge] Wrote MCP wrapper script {wrapperPath}.");
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"Could not write '{wrapperPath}': {e.Message}");
+            }
+        }
+
+        // M29 Plan 4 — reveal the resolved target file in the OS file browser
+        // so the operator can open it and paste the snippet. If the file does
+        // not exist yet (common — the wizard normally creates it), we create a
+        // VALID empty document for its format so that (a) RevealInFinder has
+        // something to select, and (b) the client does not choke on an empty
+        // file if it happens to read it before the operator pastes the snippet.
+        // JSON clients get `{}`; Codex (TOML) gets an empty string (a valid
+        // empty TOML document). This is a convenience, not a merge writer.
+        // Parent directories are created on demand. Failures are surfaced as a
+        // warning box rather than thrown, because a bad path (e.g. permissions)
+        // must never break the panel.
+        private static void RevealClientConfigTarget(
+            string targetPath, UnityOpenMcpBridge.Config.McpClientCatalog.Envelope envelope)
+        {
+            if (string.IsNullOrEmpty(targetPath)) return;
+            try
+            {
+                var dir = Path.GetDirectoryName(targetPath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+                if (!File.Exists(targetPath))
+                {
+                    var seed = envelope == UnityOpenMcpBridge.Config.McpClientCatalog.Envelope.Codex
+                        ? "" // empty TOML is valid TOML
+                        : "{}"; // valid empty JSON object
+                    File.WriteAllText(targetPath, seed);
+                }
+                EditorUtility.RevealInFinder(targetPath);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"Could not reveal '{targetPath}': {e.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Best-effort <c>IsConfigured</c> probe: returns the first path, nearest
+        /// first, that exists and contains a <c>unity-open-mcp</c> entry under
+        /// the client's merge key (or, for TOML/Codex, the
+        /// <c>[mcp_servers.unity-open-mcp]</c> table); <c>null</c> when none
+        /// does. File-read failures skip that candidate, so a missing or
+        /// unreadable file never falsely reports as configured.
+        ///
+        /// The candidate list comes from
+        /// <see cref="UnityOpenMcpBridge.Config.McpClientCatalog.ResolveSearchPaths"/>,
+        /// which walks up from the Unity project — a project at
+        /// <c>&lt;repo&gt;/Client</c> is configured by <c>&lt;repo&gt;/.cursor/mcp.json</c>,
+        /// and reporting that as "no client configured" sent operators hunting
+        /// for a problem they did not have. The content match is delegated to
+        /// <see cref="UnityOpenMcpBridge.Config.McpClientCatalog.IsConfiguredEntry"/>
+        /// so both halves of the policy stay unit-testable without a filesystem.
+        /// </summary>
+        private static string FindClientConfigPath(UnityOpenMcpBridge.Config.McpClientCatalog.ClientEntry client, string projectPath)
+        {
+            foreach (var path in UnityOpenMcpBridge.Config.McpClientCatalog.ResolveSearchPaths(client, projectPath))
+            {
+                if (string.IsNullOrEmpty(path)) continue;
+                if (!File.Exists(path)) continue;
+                try
+                {
+                    var body = File.ReadAllText(path);
+                    if (UnityOpenMcpBridge.Config.McpClientCatalog.IsConfiguredEntry(
+                            client.EnvelopeKind, body, client.MergeKey))
+                    {
+                        return path;
+                    }
+                }
+                catch
+                {
+                    // Unreadable candidate — keep looking further up.
+                }
+            }
+            return null;
+        }
+
+        // Probe the MCP server end-to-end by shelling out to its status command.
+        // Runs the process on a background thread (npx can take several seconds
+        // to resolve the package) and marshals the result back to the UI thread
+        // for display. Failures (npx missing, non-zero exit, timeout) are
+        // reported clearly and never fatal.
+        private async Task RunMcpProbeAsync(string projectPath)
+        {
+            _mcpProbeInFlight = true;
+            _mcpProbeResult = $"Probing… (running `npx -y {BridgeConstants.NpmPackage} status`)";
+            _mcpProbeMessageType = MessageType.Info;
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "npx",
+                    Arguments = $"-y {BridgeConstants.NpmPackage} status --project \"{projectPath}\"",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                };
+
+                var stdout = await ReadProcessAsync(psi, TimeSpan.FromSeconds(20)).ConfigureAwait(true);
+                var trimmed = (stdout.Stdout ?? "").Trim();
+                var trimmedErr = (stdout.Stderr ?? "").Trim();
+                var exit = stdout.ExitCode;
+
+                if (exit == 0)
+                {
+                    _mcpProbeResult = string.IsNullOrEmpty(trimmed)
+                        ? "Probe completed (exit 0, no output)."
+                        : trimmed;
+                    _mcpProbeMessageType = MessageType.Info;
+                }
+                else
+                {
+                    var msg = $"Probe exited with code {exit}.";
+                    if (!string.IsNullOrEmpty(trimmedErr)) msg += $"\n{trimmedErr}";
+                    if (!string.IsNullOrEmpty(trimmed)) msg += $"\n--- stdout ---\n{trimmed}";
+                    _mcpProbeResult = msg;
+                    _mcpProbeMessageType = MessageType.Warning;
+                }
+            }
+            catch (System.ComponentModel.Win32Exception e)
+            {
+                // Most common: `npx` not found on PATH.
+                _mcpProbeResult =
+                    $"Could not start `npx` ({e.Message}). Install Node.js (includes npx) or add it to PATH " +
+                    "to use the probe. The bridge itself does not require Node.";
+                _mcpProbeMessageType = MessageType.Warning;
+            }
+            catch (Exception e)
+            {
+                _mcpProbeResult = $"Probe failed: {e.Message}";
+                _mcpProbeMessageType = MessageType.Error;
+            }
+            finally
+            {
+                _mcpProbeInFlight = false;
+                Repaint();
+            }
+        }
+
+        // Run a process to completion off the main thread, with a hard timeout.
+        // Returns merged stdout/stderr + exit code. Captures-but-discards the
+        // process on timeout so it can't outlive the probe.
+        private static async Task<ProcessOutput> ReadProcessAsync(
+            System.Diagnostics.ProcessStartInfo psi, TimeSpan timeout)
+        {
+            return await Task.Run(() =>
+            {
+                using var p = new System.Diagnostics.Process { StartInfo = psi };
+                var stdoutBuilder = new System.Text.StringBuilder();
+                var stderrBuilder = new System.Text.StringBuilder();
+                p.OutputDataReceived += (_, e) => { if (e.Data != null) stdoutBuilder.AppendLine(e.Data); };
+                p.ErrorDataReceived += (_, e) => { if (e.Data != null) stderrBuilder.AppendLine(e.Data); };
+
+                if (!p.Start()) return new ProcessOutput("", "Failed to start process.", -1);
+                p.BeginOutputReadLine();
+                p.BeginErrorReadLine();
+
+                if (!p.WaitForExit((int)timeout.TotalMilliseconds))
+                {
+                    try { p.Kill(); } catch { }
+                    // Bounded wait for the kill to land and the async output
+                    // readers to flush their final lines before the using
+                    // below disposes the process and its pipe handles — a
+                    // reader mid-flush at Dispose would lose its tail (the
+                    // no-arg WaitForExit on the success path exists for the
+                    // same reason).
+                    try { p.WaitForExit(5_000); } catch { }
+                    return new ProcessOutput(stdoutBuilder.ToString(), "(timed out)", -1);
+                }
+                // WaitForExit(int) can return before async streams flush; this
+                // no-arg overload blocks until the readers close.
+                p.WaitForExit();
+                return new ProcessOutput(stdoutBuilder.ToString(), stderrBuilder.ToString(), p.ExitCode);
+            }).ConfigureAwait(true);
+        }
+
+        private readonly struct ProcessOutput
+        {
+            public readonly string Stdout;
+            public readonly string Stderr;
+            public readonly int ExitCode;
+            public ProcessOutput(string stdout, string stderr, int exitCode)
+            {
+                Stdout = stdout;
+                Stderr = stderr;
+                ExitCode = exitCode;
+            }
+        }
+    }
+}
